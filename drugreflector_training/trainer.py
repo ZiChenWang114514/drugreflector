@@ -364,7 +364,6 @@ class DrugReflectorTrainer:
             models.append(model)
             histories.append(history)
             
-            # Save checkpoint in format compatible with original code
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'fold_id': fold_id,
@@ -372,8 +371,8 @@ class DrugReflectorTrainer:
                 'dimensions': {
                     'input_size': X.shape[1],
                     'output_size': n_compounds,
-                    'input_names': training_data.get('gene_names', [f'gene_{i}' for i in range(X.shape[1])]),
-                    'output_names': training_data['compound_names']
+                    'input_names': list(training_data.get('gene_names', [f'gene_{i}' for i in range(X.shape[1])])),  # 确保是list
+                    'output_names': list(training_data['compound_names'])  # 确保是list
                 },
                 'params_init': {
                     'model_init_params': {
@@ -386,9 +385,15 @@ class DrugReflectorTrainer:
                             'final_layer_bias': True
                         }
                     }
+                },
+                # 添加元数据信息（可选但推荐）
+                'preprocessing_info': {
+                    'dataset': 'LINCS2020',
+                    'n_samples': len(X),
+                    'n_genes': X.shape[1],
+                    'n_compounds': n_compounds
                 }
             }
-            
             model_path = output_dir / f"model_fold_{fold_id}.pt"
             torch.save(checkpoint, model_path)
             print(f"\n  ✓ Model saved to {model_path}")
