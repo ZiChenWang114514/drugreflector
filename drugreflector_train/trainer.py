@@ -4,7 +4,6 @@ DrugReflector Trainer - Core Training Engine
 Supports both single-fold and multi-fold training with paper-compliant parameters.
 Based on Science 2025 paper and SI Table S5.
 """
-
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,12 +18,10 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, top_k_accuracy_score
 import matplotlib.pyplot as plt
 
-from drugreflector.models import nnFC
-from drugreflector_training import (
-    LINCSDataset,
-    FocalLoss,
-    clip_and_normalize_signature
-)
+from models import nnFC
+from dataset import LINCSDataset
+from losses import FocalLoss
+from preprocessing import clip_and_normalize_signature
 
 
 def compound_level_topk_recall(labels, probs, k):
