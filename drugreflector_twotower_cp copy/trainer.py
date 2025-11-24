@@ -360,65 +360,73 @@ class TwoTowerTrainer:
             try:
                 x_t, bmg, y = batch_data
                 
-                # Pre-flight checks
-                if bmg is None:
-                    print(f"⚠️  Batch {batch_idx}: bmg is None")
+                # 关键修复：在移动到GPU之前先验证
+                if bmg is None or bmg.V is None:
+                    print(f"  Batch {batch_idx}: bmg invalid before GPU transfer")
                     n_skipped += 1
                     continue
                 
-                if not hasattr(bmg, 'V') or bmg.V is None:
-                    print(f"⚠️  Batch {batch_idx}: bmg.V is None")
-                    print(f"    bmg type: {type(bmg)}")
-                    print(f"    bmg attributes: {dir(bmg)}")
-                    n_skipped += 1
-                    continue
-                
-                if not hasattr(bmg, 'E') or bmg.E is None:
-                    print(f"⚠️  Batch {batch_idx}: bmg.E is None")
-                    n_skipped += 1
-                    continue
+                # 保存原始形状用于验证
+                original_V_shape = bmg.V.shape
+                original_E_shape = bmg.E.shape
                 
                 # Move to device
                 x_t = x_t.to(self.device)
                 y = y.to(self.device)
                 
-                # Move BatchMolGraph safely
+                # 关键：正确的 GPU 传输方法
                 if self.device == 'cuda':
                     try:
-                        if hasattr(bmg, 'to'):
-                            bmg = bmg.to(self.device)
-                        else:
-                            bmg.V = bmg.V.to(self.device)
-                            bmg.E = bmg.E.to(self.device)
-                            bmg.edge_index = bmg.edge_index.to(self.device)
-                            if hasattr(bmg, 'batch'):
-                                bmg.batch = bmg.batch.to(self.device)
-                            if hasattr(bmg, 'rev_edge_index'):
-                                bmg.rev_edge_index = bmg.rev_edge_index.to(self.device)
+                        # 不使用 bmg = bmg.to(device)，会导致问题
+                        # 正确方法：逐个属性 in-place 转换
+                        
+                        if hasattr(bmg, 'V') and bmg.V is not None:
+                            bmg.V = bmg.V.to(self.device, non_blocking=True)
+                        
+                        if hasattr(bmg, 'E') and bmg.E is not None:
+                            bmg.E = bmg.E.to(self.device, non_blocking=True)
+                        
+                        if hasattr(bmg, 'edge_index') and bmg.edge_index is not None:
+                            bmg.edge_index = bmg.edge_index.to(self.device, non_blocking=True)
+                        
+                        if hasattr(bmg, 'batch') and bmg.batch is not None:
+                            bmg.batch = bmg.batch.to(self.device, non_blocking=True)
+                        
+                        if hasattr(bmg, 'rev_edge_index') and bmg.rev_edge_index is not None:
+                            bmg.rev_edge_index = bmg.rev_edge_index.to(self.device, non_blocking=True)
+                        
+                        # 🔥 验证传输后数据完整性
+                        if bmg.V is None:
+                            print(f"⚠️  Batch {batch_idx}: bmg.V became None after GPU transfer!")
+                            print(f"    Original shape was: {original_V_shape}")
+                            n_skipped += 1
+                            continue
+                        
+                        if bmg.V.shape != original_V_shape:
+                            print(f"⚠️  Batch {batch_idx}: Shape changed after GPU transfer!")
+                            print(f"    Before: {original_V_shape}, After: {bmg.V.shape}")
+                            n_skipped += 1
+                            continue
+                        
                     except Exception as e:
-                        print(f"⚠️  Batch {batch_idx}: Error moving to GPU: {e}")
+                        print(f"  Batch {batch_idx}: GPU transfer failed: {e}")
                         n_skipped += 1
                         continue
                 
-                # Forward pass with error handling
+                # Forward pass
                 optimizer.zero_grad()
                 
                 try:
                     outputs = model(x_t, bmg)
                 except Exception as e:
                     print(f"⚠️  Batch {batch_idx}: Forward pass failed: {e}")
-                    import traceback
-                    traceback.print_exc()
                     n_skipped += 1
                     continue
                 
                 # Backward pass
                 loss = criterion(outputs, y)
                 loss.backward()
-                
-                # Gradient clipping (optional, helps stability)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 
                 total_loss += loss.item()
@@ -426,8 +434,6 @@ class TwoTowerTrainer:
                 
             except Exception as e:
                 print(f"⚠️  Batch {batch_idx}: Unexpected error: {e}")
-                import traceback
-                traceback.print_exc()
                 n_skipped += 1
                 continue
         
@@ -439,9 +445,9 @@ class TwoTowerTrainer:
         if n_skipped > 0:
             print(f"  ⚠️  Skipped {n_skipped} batches this epoch")
         
-        return total_loss / n_batches     
+        return total_loss / n_batches
 
-    
+
     def _validate_epoch(self, model, loader, criterion):
         """Validate one epoch."""
         model.eval()
@@ -449,26 +455,64 @@ class TwoTowerTrainer:
         all_preds = []
         all_labels = []
         all_probs = []
+        n_skipped = 0
         
         with torch.no_grad():
-            for x_t, bmg, y in tqdm(loader, desc="Validating", leave=False,
-                                disable=not self.verbose):
-                x_t = x_t.to(self.device)
-                y = y.to(self.device)
-                bmg = bmg.to(self.device)
-                
-                outputs = model(x_t, bmg)
-                loss = criterion(outputs, y)
-                total_loss += loss.item()
-                
-                probs = F.softmax(outputs, dim=1)
-                preds = torch.argmax(probs, dim=1)
-                
-                all_preds.append(preds.cpu().numpy())
-                all_labels.append(y.cpu().numpy())
-                all_probs.append(probs.cpu().numpy())
+            for batch_idx, batch_data in enumerate(tqdm(loader, desc="Validating", 
+                                                        leave=False,
+                                                        disable=not self.verbose)):
+                try:
+                    x_t, bmg, y = batch_data
+                    
+                    # 验证
+                    if bmg is None or bmg.V is None:
+                        n_skipped += 1
+                        continue
+                    
+                    # Move to device
+                    x_t = x_t.to(self.device)
+                    y = y.to(self.device)
+                    
+                    # GPU 传输（同训练）
+                    if self.device == 'cuda':
+                        if hasattr(bmg, 'V') and bmg.V is not None:
+                            bmg.V = bmg.V.to(self.device, non_blocking=True)
+                        if hasattr(bmg, 'E') and bmg.E is not None:
+                            bmg.E = bmg.E.to(self.device, non_blocking=True)
+                        if hasattr(bmg, 'edge_index') and bmg.edge_index is not None:
+                            bmg.edge_index = bmg.edge_index.to(self.device, non_blocking=True)
+                        if hasattr(bmg, 'batch') and bmg.batch is not None:
+                            bmg.batch = bmg.batch.to(self.device, non_blocking=True)
+                        if hasattr(bmg, 'rev_edge_index') and bmg.rev_edge_index is not None:
+                            bmg.rev_edge_index = bmg.rev_edge_index.to(self.device, non_blocking=True)
+                        
+                        if bmg.V is None:
+                            n_skipped += 1
+                            continue
+                    
+                    outputs = model(x_t, bmg)
+                    loss = criterion(outputs, y)
+                    total_loss += loss.item()
+                    
+                    probs = F.softmax(outputs, dim=1)
+                    preds = torch.argmax(probs, dim=1)
+                    
+                    all_preds.append(preds.cpu().numpy())
+                    all_labels.append(y.cpu().numpy())
+                    all_probs.append(probs.cpu().numpy())
+                    
+                except Exception as e:
+                    print(f"⚠️  Validation batch {batch_idx} failed: {e}")
+                    n_skipped += 1
+                    continue
         
-        avg_loss = total_loss / len(loader)
+        if len(all_preds) == 0:
+            raise RuntimeError("No valid validation batches!")
+        
+        if n_skipped > 0:
+            print(f"  ⚠️  Skipped {n_skipped} validation batches")
+        
+        avg_loss = total_loss / len(all_preds)
         
         all_preds = np.concatenate(all_preds)
         all_labels = np.concatenate(all_labels)
@@ -485,7 +529,7 @@ class TwoTowerTrainer:
             'top1_acc': top1_acc,
             'top10_acc': top10_acc
         }
-    
+        
     def _save_checkpoint(
         self,
         model: nn.Module,

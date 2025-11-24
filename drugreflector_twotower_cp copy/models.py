@@ -45,7 +45,9 @@ class ChemicalEncoder(nn.Module):
         mpnn_depth: int = 3, 
         dropout: float = 0.0,
         use_3d: bool = False,
-        d_coord: int = 16
+        d_coord: int = 16,
+        d_v: Optional[int] = None,  # 允许外部指定
+        d_e: Optional[int] = None   # 允许外部指定
     ):
         super().__init__()
         
@@ -56,16 +58,26 @@ class ChemicalEncoder(nn.Module):
         self.use_3d = use_3d
         self.d_coord = d_coord
         
-        # Determine atom feature dimension
-        # Default: 133 (Chemprop2 v2 atom featurizer)
-        # With 3D: 133 + d_coord (coordinate features)
-        d_v_base = 133
-        d_v = d_v_base + d_coord if use_3d else d_v_base
+        # 自动检测特征维度
+        if d_v is None or d_e is None:
+            from chemprop.featurizers import SimpleMoleculeMolGraphFeaturizer
+            featurizer = SimpleMoleculeMolGraphFeaturizer()
+            d_v = featurizer.atom_fdim if d_v is None else d_v
+            d_e = featurizer.bond_fdim if d_e is None else d_e
         
-        # Chemprop2 MPNN with expanded atom features
+        self.d_v = d_v
+        self.d_e = d_e
+        
+        # 如果使用3D，增加坐标特征维度
+        if use_3d:
+            d_v = d_v + d_coord
+        
+        print(f"  🔧 ChemicalEncoder feature dims: d_v={d_v}, d_e={d_e}")
+        
+        # Chemprop2 MPNN
         self.mpnn = cnn.BondMessagePassing(
             d_v=d_v,
-            d_e=14,  # Default bond feature dim
+            d_e=d_e,
             d_h=output_dim,
             depth=mpnn_depth,
             dropout=dropout,
@@ -75,9 +87,9 @@ class ChemicalEncoder(nn.Module):
         # 3D coordinate encoder (if enabled)
         if use_3d:
             self.coord_encoder = nn.Sequential(
-                nn.Linear(3, d_coord // 2),  # xyz -> hidden
+                nn.Linear(3, d_coord // 2),
                 nn.ReLU(),
-                nn.Linear(d_coord // 2, d_coord)  # hidden -> d_coord
+                nn.Linear(d_coord // 2, d_coord)
             )
         
         # Aggregation

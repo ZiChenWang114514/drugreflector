@@ -40,7 +40,8 @@ class TwoTowerDataset(Dataset):
         y: np.ndarray,
         compound_ids: np.ndarray,
         smiles_dict: Dict[str, str],
-        fold_mask: Optional[np.ndarray] = None
+        fold_mask: Optional[np.ndarray] = None,
+        preload_to_gpu: bool = False
     ):
         if not CHEMPROP_AVAILABLE:
             raise ImportError("Chemprop is required")
@@ -60,9 +61,13 @@ class TwoTowerDataset(Dataset):
         # Create molecule featurizer
         self.mol_featurizer = SimpleMoleculeMolGraphFeaturizer()
         
+        print(f"  🔧 Featurizer dimensions:")
+        print(f"    Atom feature dim: {self.mol_featurizer.atom_fdim}")
+        print(f"    Bond feature dim: {self.mol_featurizer.bond_fdim}")
+        
         print(" Pre-featurizing and validating molecules...")
         self.mol_cache = {}
-        self.mol_graph_cache = {}  # ������ 新增：缓存MolGraph
+        self.mol_graph_cache = {}  # 缓存MolGraph
         unique_compounds = np.unique(self.compound_ids)
         
         n_valid = 0
@@ -152,7 +157,7 @@ class TwoTowerDataset(Dataset):
             print(f"    Bond features: {test_graph.E.shape}")
             print(f"    Edge index: {test_graph.edge_index.shape}")
             
-            # ������ 测试能否创建BatchMolGraph
+            # 测试能否创建BatchMolGraph
             try:
                 from chemprop.data import BatchMolGraph
                 test_batch = BatchMolGraph([test_graph])
@@ -183,6 +188,31 @@ class TwoTowerDataset(Dataset):
         if n_valid_samples == 0:
             raise ValueError("No valid samples found!")
     
+        self.preload_to_gpu = preload_to_gpu
+        
+        if self.preload_to_gpu and torch.cuda.is_available():
+            print("  🚀 Pre-loading molecular graphs to GPU...")
+            
+            gpu_cache = {}
+            for comp_id, mol_graph in self.mol_graph_cache.items():
+                try:
+                    # 创建 GPU 版本
+                    gpu_graph = type(mol_graph)(
+                        V=mol_graph.V.to('cuda'),
+                        E=mol_graph.E.to('cuda'),
+                        edge_index=mol_graph.edge_index.to('cuda'),
+                        rev_edge_index=mol_graph.rev_edge_index.to('cuda') if hasattr(mol_graph, 'rev_edge_index') else None
+                    )
+                    gpu_cache[comp_id] = gpu_graph
+                    
+                except Exception as e:
+                    print(f"    ⚠️  Failed to move {comp_id} to GPU: {e}")
+                    # 保留 CPU 版本
+                    gpu_cache[comp_id] = mol_graph
+            
+            self.mol_graph_cache = gpu_cache
+            print(f"  ✓ Pre-loaded {len(gpu_cache)} graphs to GPU")
+        
     def __len__(self):
         return self.valid_mask.sum()
     
