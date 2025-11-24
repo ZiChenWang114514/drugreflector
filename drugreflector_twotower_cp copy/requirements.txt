@@ -1,0 +1,13 @@
+# Core dependencies
+torch>=1.13.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+tqdm>=4.62.0
+matplotlib>=3.5.0
+
+# Chemprop2 for molecular encoding
+chemprop>=2.0.0
+
+# RDKit for molecular processing
+rdkit>=2022.9.1
