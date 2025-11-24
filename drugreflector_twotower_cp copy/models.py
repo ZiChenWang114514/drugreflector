@@ -46,8 +46,8 @@ class ChemicalEncoder(nn.Module):
         dropout: float = 0.0,
         use_3d: bool = False,
         d_coord: int = 16,
-        d_v: Optional[int] = None,  # 允许外部指定
-        d_e: Optional[int] = None   # 允许外部指定
+        d_v: Optional[int] = None,
+        d_e: Optional[int] = None
     ):
         super().__init__()
         
@@ -62,35 +62,46 @@ class ChemicalEncoder(nn.Module):
         if d_v is None or d_e is None:
             from chemprop.featurizers import SimpleMoleculeMolGraphFeaturizer
             featurizer = SimpleMoleculeMolGraphFeaturizer()
-            d_v = featurizer.atom_fdim if d_v is None else d_v
+            d_v_base = featurizer.atom_fdim if d_v is None else d_v
             d_e = featurizer.bond_fdim if d_e is None else d_e
+        else:
+            d_v_base = d_v
         
-        self.d_v = d_v
+        # 保存原始维度
+        self.d_v_base = d_v_base  # 原始atom特征维度 (72)
         self.d_e = d_e
         
-        # 如果使用3D，增加坐标特征维度
+        # 如果使用3D，计算最终的atom特征维度
         if use_3d:
-            d_v = d_v + d_coord
-        
-        print(f"  🔧 ChemicalEncoder feature dims: d_v={d_v}, d_e={d_e}")
-        
-        # Chemprop2 MPNN
-        self.mpnn = cnn.BondMessagePassing(
-            d_v=d_v,
-            d_e=d_e,
-            d_h=output_dim,
-            depth=mpnn_depth,
-            dropout=dropout,
-            activation='relu'
-        )
-        
-        # 3D coordinate encoder (if enabled)
-        if use_3d:
+            self.d_v = d_v_base + d_coord  # 72 + 16 = 88
+            # 初始化3D坐标编码器
             self.coord_encoder = nn.Sequential(
                 nn.Linear(3, d_coord // 2),
                 nn.ReLU(),
                 nn.Linear(d_coord // 2, d_coord)
             )
+        else:
+            self.d_v = d_v_base
+            self.coord_encoder = None
+        
+        print(f"  ChemicalEncoder feature dims:")
+        print(f"    Base atom dim (d_v_base): {self.d_v_base}")
+        if use_3d:
+            print(f"    3D coord dim: {d_coord}")
+            print(f"    Final atom dim (d_v): {self.d_v} (= {self.d_v_base} + {d_coord})")
+        else:
+            print(f"    Final atom dim (d_v): {self.d_v}")
+        print(f"    Bond dim (d_e): {self.d_e}")
+        
+        # 使用正确的维度初始化MPNN
+        self.mpnn = cnn.BondMessagePassing(
+            d_v=self.d_v,  # 使用self.d_v而不是局部变量d_v
+            d_e=self.d_e,
+            d_h=output_dim,
+            depth=mpnn_depth,
+            dropout=dropout,
+            activation='relu'
+        )
         
         # Aggregation
         self.agg = cnn.MeanAggregation()
@@ -99,6 +110,32 @@ class ChemicalEncoder(nn.Module):
         self.bn = nn.BatchNorm1d(output_dim)
     
     def _compute_3d_features(self, coords):
+        """
+        Compute 3D geometric features from atomic coordinates.
+        
+        Parameters
+        ----------
+        coords : torch.Tensor
+            Atomic coordinates (n_atoms, 3)
+        
+        Returns
+        -------
+        torch.Tensor
+            3D features (n_atoms, d_coord) - 精确维度
+        """
+        # 简化，直接编码坐标到目标维度
+        coord_features = self.coord_encoder(coords)  # (n_atoms, d_coord)
+        
+        # 验证输出维度
+        if coord_features.shape[1] != self.d_coord:
+            raise RuntimeError(
+                f"coord_encoder output dim mismatch: "
+                f"expected {self.d_coord}, got {coord_features.shape[1]}"
+            )
+        
+        return coord_features
+
+    def _compute_3d_features_prev(self, coords):
         """
         Compute 3D geometric features from atomic coordinates.
         
@@ -150,28 +187,47 @@ class ChemicalEncoder(nn.Module):
             Batch of molecular graphs from Chemprop
         coords_3d : torch.Tensor, optional
             3D coordinates (n_atoms_total, 3) for all atoms in batch
-            If provided and use_3d=True, will be integrated into atom features
         
         Returns
         -------
         torch.Tensor
             Molecular embeddings (batch_size, output_dim)
         """
-        # 🔥 关键修复：检查 bmg 是否有效
+        # 验证输入
         if bmg is None or not hasattr(bmg, 'V') or bmg.V is None:
-            raise ValueError(
-                "Invalid BatchMolGraph: bmg.V is None. "
-                "Check that molecules were properly featurized in collate_fn."
-            )
+            raise ValueError("Invalid BatchMolGraph: bmg.V is None.")
         
-        # Integrate 3D coordinates if available
+        # 在使用3D时，验证并拼接特征
         if self.use_3d and coords_3d is not None:
-            # Compute 3D features
+            # 验证原始atom特征维度
+            if bmg.V.shape[1] != self.d_v_base:
+                raise ValueError(
+                    f"Unexpected atom feature dim: expected {self.d_v_base}, "
+                    f"got {bmg.V.shape[1]}"
+                )
+            
+            # 计算3D特征
             coord_features = self._compute_3d_features(coords_3d)  # (n_atoms, d_coord)
             
-            # 扩展原子特征（如果维度匹配）
-            if coord_features.shape[0] == bmg.V.shape[0]:
-                bmg.V = torch.cat([bmg.V, coord_features], dim=1)
+            # 验证原子数匹配
+            if coord_features.shape[0] != bmg.V.shape[0]:
+                raise ValueError(
+                    f"Atom count mismatch: bmg.V has {bmg.V.shape[0]} atoms, "
+                    f"coords_3d has {coord_features.shape[0]} atoms"
+                )
+            
+            # 拼接特征
+            bmg.V = torch.cat([bmg.V, coord_features], dim=1)  # (n_atoms, 72+16=88)
+            
+            # 最终验证
+            if bmg.V.shape[1] != self.d_v:
+                raise ValueError(
+                    f"Final atom feature dim mismatch: expected {self.d_v}, "
+                    f"got {bmg.V.shape[1]}"
+                )
+        
+        elif self.use_3d and coords_3d is None:
+            raise ValueError("use_3d=True but coords_3d is None")
         
         # Message passing
         H_v = self.mpnn(bmg)
@@ -409,7 +465,7 @@ class TwoTowerModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def forward(self, x_transcript, bmg_chem):
+    def forward(self, x_transcript, bmg_chem, coords_3d=None):
         """
         Forward pass.
         
@@ -419,6 +475,8 @@ class TwoTowerModel(nn.Module):
             Gene expression (batch_size, n_genes)
         bmg_chem : BatchMolGraph
             Batch of molecular graphs
+        coords_3d : torch.Tensor, optional
+            3D coordinates (total_atoms, 3)
         
         Returns
         -------
@@ -426,7 +484,7 @@ class TwoTowerModel(nn.Module):
             Logits (batch_size, n_compounds)
         """
         # Encode both modalities
-        h_chem = self.chem_encoder(bmg_chem)
+        h_chem = self.chem_encoder(bmg_chem, coords_3d)
         h_transcript = self.transcript_encoder(x_transcript)
         
         # Fuse features

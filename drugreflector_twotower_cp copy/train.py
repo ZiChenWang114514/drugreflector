@@ -84,6 +84,14 @@ def main():
     parser.add_argument('--folds', type=int, nargs='+', choices=[0,1,2],
                        help='Train specific folds')
     
+    # Scaffold split options
+    parser.add_argument('--use-scaffold-split', action='store_true',
+                       help='Use scaffold-based split instead of random folds')
+    parser.add_argument('--scaffold-folds', type=int, default=3,
+                       help='Number of scaffold-based folds (only with --use-scaffold-split)')
+    parser.add_argument('--scaffold-seed', type=int, default=42,
+                       help='Random seed for scaffold splitting')
+    
     # Architecture
     parser.add_argument('--chem-hidden-dim', type=int, default=512,
                        help='Chemical encoder output dimension')
@@ -137,6 +145,33 @@ def main():
     compound_info = Path(args.compound_info)
     training_data = load_training_data(data_file, compound_info)
     
+    if args.use_scaffold_split:
+        from scaffold_split import create_scaffold_folds
+        
+        print(f"\n{'='*80}")
+        print(f"🧬 Creating Scaffold-Based Splits")
+        print(f"{'='*80}")
+        
+        sample_meta = training_data['sample_meta']
+        compound_ids = sample_meta['pert_id'].values
+        smiles_dict = training_data['smiles_dict']
+        
+        # Create scaffold-based folds
+        scaffold_folds = create_scaffold_folds(
+            compound_ids=compound_ids,
+            smiles_dict=smiles_dict,
+            n_folds=args.scaffold_folds,
+            seed=args.scaffold_seed
+        )
+        
+        # Replace original folds
+        training_data['folds'] = scaffold_folds
+        training_data['scaffold_split'] = True
+        
+        print(f"  ✓ Replaced original folds with scaffold-based splits")
+    else:
+        training_data['scaffold_split'] = False
+
     # Create trainer
     trainer = TwoTowerTrainer(
         device=args.device,

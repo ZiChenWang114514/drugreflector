@@ -41,11 +41,15 @@ class TwoTowerDataset(Dataset):
         compound_ids: np.ndarray,
         smiles_dict: Dict[str, str],
         fold_mask: Optional[np.ndarray] = None,
-        preload_to_gpu: bool = False
+        preload_to_gpu: bool = False,
+        use_3d: bool = False,
+        conformer_method: str = 'ETKDG',
     ):
         if not CHEMPROP_AVAILABLE:
             raise ImportError("Chemprop is required")
         
+        self.use_3d = use_3d
+        self.conformer_method = conformer_method
         # Apply fold mask
         if fold_mask is not None:
             self.X = X[fold_mask]
@@ -88,7 +92,7 @@ class TwoTowerDataset(Dataset):
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None:
                     n_invalid_mol += 1
-                    print(f"  ⚠️  Invalid SMILES for {comp_id}: {smiles}")
+                    print(f"  !  Invalid SMILES for {comp_id}: {smiles}")
                     continue
                 
                 # 检查点3: 能否特征化
@@ -97,17 +101,17 @@ class TwoTowerDataset(Dataset):
                 # 检查点4: 特征化结果是否有效
                 if mol_graph is None:
                     n_invalid_graph += 1
-                    print(f"  ⚠️  Featurization returned None for {comp_id}")
+                    print(f"  !  Featurization returned None for {comp_id}")
                     continue
                 
                 if not hasattr(mol_graph, 'V') or mol_graph.V is None:
                     n_invalid_graph += 1
-                    print(f"  ⚠️  MolGraph.V is None for {comp_id}")
+                    print(f"  !  MolGraph.V is None for {comp_id}")
                     continue
                 
                 if not hasattr(mol_graph, 'E') or mol_graph.E is None:
                     n_invalid_graph += 1
-                    print(f"  ⚠️  MolGraph.E is None for {comp_id}")
+                    print(f"  !  MolGraph.E is None for {comp_id}")
                     continue
                 
                 # 验证特征维度
@@ -116,24 +120,36 @@ class TwoTowerDataset(Dataset):
                 
                 if mol_graph.V.shape[1] != expected_atom_dim:
                     n_invalid_graph += 1
-                    print(f"  ⚠️  Wrong atom feature dim for {comp_id}: "
+                    print(f"  !  Wrong atom feature dim for {comp_id}: "
                           f"got {mol_graph.V.shape[1]}, expected {expected_atom_dim}")
                     continue
                 
                 if mol_graph.E.shape[1] != expected_bond_dim:
                     n_invalid_graph += 1
-                    print(f"  ⚠️  Wrong bond feature dim for {comp_id}: "
+                    print(f"  !  Wrong bond feature dim for {comp_id}: "
                           f"got {mol_graph.E.shape[1]}, expected {expected_bond_dim}")
                     continue
                 
                 # 全部通过，缓存
                 self.mol_cache[comp_id] = mol
                 self.mol_graph_cache[comp_id] = mol_graph
+                
+                # 如果使用3D，生成坐标
+                if self.use_3d:
+                    coords_3d = self._generate_conformer(mol)
+                    if coords_3d is not None:
+                        # 缓存3D坐标（作为torch tensor）
+                        if not hasattr(self, 'coords_3d_cache'):
+                            self.coords_3d_cache = {}
+                        self.coords_3d_cache[comp_id] = torch.FloatTensor(coords_3d)
+                    else:
+                        print(f"  !  Failed to generate 3D coords for {comp_id}, will skip in training")
+
                 n_valid += 1
                 
             except Exception as e:
                 n_invalid_graph += 1
-                print(f"  ⚠️  Error processing {comp_id}: {e}")
+                print(f"  !  Error processing {comp_id}: {e}")
                 continue
         
         # 报告统计
@@ -206,7 +222,7 @@ class TwoTowerDataset(Dataset):
                     gpu_cache[comp_id] = gpu_graph
                     
                 except Exception as e:
-                    print(f"    ⚠️  Failed to move {comp_id} to GPU: {e}")
+                    print(f"    !  Failed to move {comp_id} to GPU: {e}")
                     # 保留 CPU 版本
                     gpu_cache[comp_id] = mol_graph
             
@@ -223,27 +239,61 @@ class TwoTowerDataset(Dataset):
         Returns
         -------
         tuple
-            (x_transcript, mol_graph, y_label)  # 直接返回MolGraph
+            If use_3d=False: (x_transcript, mol_graph, y_label)
+            If use_3d=True:  (x_transcript, mol_graph, coords_3d, y_label)
         """
-        # Map to valid index
         valid_indices = np.where(self.valid_mask)[0]
         actual_idx = valid_indices[idx]
         
-        # Get transcriptome data
         x_transcript = torch.FloatTensor(self.X[actual_idx])
         y_label = torch.LongTensor([self.y[actual_idx]])[0]
         
-        # 直接从缓存获取MolGraph (不是MoleculeDatapoint)
         comp_id = self.compound_ids[actual_idx]
         mol_graph = self.mol_graph_cache[comp_id]
         
-        # 最后一次验证
         if mol_graph.V is None:
             raise RuntimeError(f"MolGraph.V is None for compound {comp_id} at idx {idx}")
         
-        return x_transcript, mol_graph, y_label
+        # 🔥 如果使用3D，返回坐标
+        if self.use_3d:
+            coords_3d = self.coords_3d_cache.get(comp_id)
+            if coords_3d is None:
+                # 如果没有3D坐标，返回零向量（fallback）
+                n_atoms = mol_graph.V.shape[0]
+                coords_3d = torch.zeros(n_atoms, 3)
+            return x_transcript, mol_graph, coords_3d, y_label
+        else:
+            return x_transcript, mol_graph, y_label
 
-
+    def _generate_conformer(self, mol):
+        """
+        Generate 3D conformer for a molecule.
+        
+        Parameters
+        ----------
+        mol : Chem.Mol
+            RDKit molecule
+        
+        Returns
+        -------
+        np.ndarray or None
+            3D coordinates (n_atoms, 3)
+        """
+        from conformer_utils import ConformerGenerator
+        
+        if not hasattr(self, '_conformer_gen'):
+            self._conformer_gen = ConformerGenerator(
+                method=self.conformer_method,
+                num_confs=1,
+                optimize=True
+            )
+        
+        try:
+            coords = self._conformer_gen.generate(mol)
+            return coords
+        except Exception as e:
+            return None
+        
 def collate_two_tower(batch):
     """
     Custom collate function for batching.
@@ -251,60 +301,61 @@ def collate_two_tower(batch):
     Parameters
     ----------
     batch : list
-        List of (x_transcript, mol_graph, y_label) tuples
+        List of tuples from __getitem__:
+        - If use_3d=False: (x_transcript, mol_graph, y_label)
+        - If use_3d=True:  (x_transcript, mol_graph, coords_3d, y_label)
     
     Returns
     -------
     tuple
-        (x_transcript_batch, bmg_batch, y_batch)
+        If use_3d=False: (x_batch, bmg_batch, y_batch)
+        If use_3d=True:  (x_batch, bmg_batch, coords_3d_batch, y_batch)
     """
     from chemprop.data import BatchMolGraph
     
-    # Separate components
     x_transcripts = []
     mol_graphs = []
+    coords_3d_list = []
     y_labels = []
     
-    for x_t, mol_graph, y in batch:
-        # 在collate时再次验证
-        if mol_graph is None:
+    # 检测是否使用3D（根据batch元素长度判断）
+    use_3d = len(batch[0]) == 4
+    
+    for item in batch:
+        if use_3d:
+            x_t, mol_graph, coords_3d, y = item
+            coords_3d_list.append(coords_3d)
+        else:
+            x_t, mol_graph, y = item
+        
+        # 验证
+        if mol_graph is None or not hasattr(mol_graph, 'V') or mol_graph.V is None:
             raise ValueError("Received None mol_graph in collate_fn")
-        if not hasattr(mol_graph, 'V') or mol_graph.V is None:
-            raise ValueError("mol_graph.V is None in collate_fn")
         
         x_transcripts.append(x_t)
         mol_graphs.append(mol_graph)
         y_labels.append(y)
     
-    # Stack transcriptome data
+    # Stack
     x_batch = torch.stack(x_transcripts)
     y_batch = torch.stack(y_labels)
     
-    # 创建 BatchMolGraph (输入已经是MolGraph列表)
+    # Create BatchMolGraph
     try:
         bmg_batch = BatchMolGraph(mol_graphs)
         
-        # 立即验证
         if bmg_batch.V is None:
-            # 调试信息
-            print(f"❌ BatchMolGraph.V is None!")
-            print(f"   Number of graphs: {len(mol_graphs)}")
-            for i, g in enumerate(mol_graphs):
-                print(f"   Graph {i}: V={g.V.shape if g.V is not None else None}, "
-                      f"E={g.E.shape if g.E is not None else None}")
             raise ValueError("BatchMolGraph.V is None after creation")
-        
         if bmg_batch.E is None:
             raise ValueError("BatchMolGraph.E is None after creation")
         
-        # 打印调试信息
-        print(f"✓ Created BatchMolGraph: V={bmg_batch.V.shape}, E={bmg_batch.E.shape}")
-        
     except Exception as e:
         print(f"❌ Error creating BatchMolGraph: {e}")
-        print(f"   Batch size: {len(mol_graphs)}")
-        for i, g in enumerate(mol_graphs):
-            print(f"   Graph {i} valid: V={g.V is not None}, E={g.E is not None}")
         raise
     
-    return x_batch, bmg_batch, y_batch
+    # 如果使用3D，拼接所有坐标
+    if use_3d:
+        coords_3d_batch = torch.cat(coords_3d_list, dim=0)  # (total_atoms, 3)
+        return x_batch, bmg_batch, coords_3d_batch, y_batch
+    else:
+        return x_batch, bmg_batch, y_batch

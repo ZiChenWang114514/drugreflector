@@ -21,11 +21,15 @@ from preprocessing import clip_and_normalize_signature
 
 
 def compound_level_topk_recall(labels, probs, k):
-    """Compute compound-level top-k recall."""
+    """
+    Compute compound-level top-k recall.
+    
+    修改：确保k不超过实际类别数
+    """
     labels = np.asarray(labels)
     probs = np.asarray(probs)
     n_classes = probs.shape[1]
-    k = max(1, min(k, n_classes))
+    k = max(1, min(k, n_classes))  # 确保k有效
 
     topk_pred = np.argpartition(-probs, kth=k-1, axis=1)[:, :k]
     hit_per_sample = (topk_pred == labels[:, None]).any(axis=1).astype(float)
@@ -186,17 +190,32 @@ class TwoTowerTrainer:
         
         # Create datasets
         train_dataset = TwoTowerDataset(
-            X_processed, y, compound_ids, smiles_dict, train_mask
+            X_processed, y, compound_ids, smiles_dict, train_mask,
+            use_3d=self.use_3d, conformer_method=self.conformer_method
         )
         val_dataset = TwoTowerDataset(
-            X_processed, y, compound_ids, smiles_dict, val_mask
+            X_processed, y, compound_ids, smiles_dict, val_mask,
+            use_3d=self.use_3d, conformer_method=self.conformer_method
         )
+
+        # 统计训练集和验证集的类别分布
+        train_compounds = np.unique(y[train_mask])
+        val_compounds = np.unique(y[val_mask])
         
         if self.verbose:
-            print(f"\n������ Data Split:")
-            print(f"  Train: {len(train_dataset):,}")
-            print(f"  Val: {len(val_dataset):,}")
-        
+            print(f"\n Data Split:")
+            print(f"  Train: {len(train_dataset):,} samples")
+            print(f"    - {len(train_compounds)} unique compounds")
+            print(f"  Val: {len(val_dataset):,} samples")
+            print(f"    - {len(val_compounds)} unique compounds")
+            
+            # 检查是否有类别重叠
+            overlap = set(train_compounds) & set(val_compounds)
+            if len(overlap) > 0:
+                print(f"    !  {len(overlap)} compounds appear in both train and val")
+            else:
+                print(f"    ✓ No compound overlap (scaffold split detected)")
+                
         # Create loaders
         train_loader = DataLoader(
             train_dataset,
@@ -298,7 +317,8 @@ class TwoTowerTrainer:
         model_path = output_dir / f"model_fold_{fold_id}.pt"
         self._save_checkpoint(
             model, fold_id, history, n_genes, n_compounds,
-            compound_names, model_path
+            compound_names, model_path,
+            scaffold_split=training_data.get('scaffold_split', False)
         )
         
         if self.verbose:
@@ -358,8 +378,12 @@ class TwoTowerTrainer:
                                                     leave=False, 
                                                     disable=not self.verbose)):
             try:
-                x_t, bmg, y = batch_data
-                
+                if len(batch_data) == 4:
+                    x_t, bmg, coords_3d, y = batch_data
+                else:
+                    x_t, bmg, y = batch_data
+                    coords_3d = None
+                    
                 # 关键修复：在移动到GPU之前先验证
                 if bmg is None or bmg.V is None:
                     print(f"  Batch {batch_idx}: bmg invalid before GPU transfer")
@@ -374,6 +398,10 @@ class TwoTowerTrainer:
                 x_t = x_t.to(self.device)
                 y = y.to(self.device)
                 
+                # Move 3D coords to device
+                if coords_3d is not None:
+                    coords_3d = coords_3d.to(self.device)
+                    
                 # 关键：正确的 GPU 传输方法
                 if self.device == 'cuda':
                     try:
@@ -395,7 +423,7 @@ class TwoTowerTrainer:
                         if hasattr(bmg, 'rev_edge_index') and bmg.rev_edge_index is not None:
                             bmg.rev_edge_index = bmg.rev_edge_index.to(self.device, non_blocking=True)
                         
-                        # 🔥 验证传输后数据完整性
+                        # ������ 验证传输后数据完整性
                         if bmg.V is None:
                             print(f"⚠️  Batch {batch_idx}: bmg.V became None after GPU transfer!")
                             print(f"    Original shape was: {original_V_shape}")
@@ -417,7 +445,7 @@ class TwoTowerTrainer:
                 optimizer.zero_grad()
                 
                 try:
-                    outputs = model(x_t, bmg)
+                    outputs = model(x_t, bmg, coords_3d)
                 except Exception as e:
                     print(f"⚠️  Batch {batch_idx}: Forward pass failed: {e}")
                     n_skipped += 1
@@ -456,22 +484,30 @@ class TwoTowerTrainer:
         all_labels = []
         all_probs = []
         n_skipped = 0
-        
+            
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(tqdm(loader, desc="Validating", 
                                                         leave=False,
                                                         disable=not self.verbose)):
                 try:
-                    x_t, bmg, y = batch_data
+                    if len(batch_data) == 4:
+                        x_t, bmg, coords_3d, y = batch_data
+                    else:
+                        x_t, bmg, y = batch_data
+                        coords_3d = None
                     
                     # 验证
                     if bmg is None or bmg.V is None:
+                        print(f"  Batch {batch_idx}: bmg invalid before GPU transfer")
                         n_skipped += 1
                         continue
                     
                     # Move to device
                     x_t = x_t.to(self.device)
                     y = y.to(self.device)
+                    
+                    if coords_3d is not None:
+                        coords_3d = coords_3d.to(self.device)
                     
                     # GPU 传输（同训练）
                     if self.device == 'cuda':
@@ -490,7 +526,7 @@ class TwoTowerTrainer:
                             n_skipped += 1
                             continue
                     
-                    outputs = model(x_t, bmg)
+                    outputs = model(x_t, bmg, coords_3d)
                     loss = criterion(outputs, y)
                     total_loss += loss.item()
                     
@@ -518,18 +554,61 @@ class TwoTowerTrainer:
         all_labels = np.concatenate(all_labels)
         all_probs = np.concatenate(all_probs)
         
-        top1_acc = accuracy_score(all_labels, all_preds)
-        top10_acc = top_k_accuracy_score(all_labels, all_probs, k=10)
+        # 获取验证集中实际出现的类别
+        unique_labels = np.unique(all_labels)
+        n_classes_in_val = len(unique_labels)
+        n_classes_total = all_probs.shape[1]
         
-        top1_percent_k = max(1, int(0.01 * all_probs.shape[1]))
-        recall = compound_level_topk_recall(all_labels, all_probs, top1_percent_k)
+        # Top-1 accuracy (不受影响)
+        top1_acc = accuracy_score(all_labels, all_preds)
+        
+        # Top-10 accuracy：需要考虑验证集类别数
+        # 如果验证集类别数 < 10，则使用实际类别数
+        k_for_top10 = min(10, n_classes_in_val)
+        
+        if n_classes_in_val < n_classes_total:
+            # Scaffold split情况：验证集类别少于总类别
+            # 方法1：只考虑验证集中出现的类别的概率
+            # 创建label到索引的映射
+            label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+            
+            # 提取验证集类别对应的概率
+            probs_subset = all_probs[:, unique_labels]
+            
+            # 使用子集概率计算top-k accuracy
+            top10_acc = top_k_accuracy_score(
+                all_labels, 
+                probs_subset, 
+                k=k_for_top10,
+                labels=unique_labels  # 明确指定类别
+            )
+            
+            if self.verbose and n_classes_in_val < n_classes_total:
+                print(f"  !  Validation set contains {n_classes_in_val}/{n_classes_total} classes")
+        else:
+            # 原始情况：验证集包含所有类别
+            top10_acc = top_k_accuracy_score(all_labels, all_probs, k=k_for_top10)
+        
+        # Recall计算：使用验证集实际类别数
+        top1_percent_k = max(1, int(0.01 * n_classes_in_val))
+        
+        # 使用子集概率计算recall
+        if n_classes_in_val < n_classes_total:
+            probs_for_recall = all_probs[:, unique_labels]
+        else:
+            probs_for_recall = all_probs
+        
+        recall = compound_level_topk_recall(all_labels, probs_for_recall, top1_percent_k)
         
         return avg_loss, {
             'recall': recall,
             'top1_acc': top1_acc,
-            'top10_acc': top10_acc
+            'top10_acc': top10_acc,
+            'n_classes_val': n_classes_in_val,  # 额外返回验证集类别数
+            'k_used': k_for_top10  # 实际使用的k值
         }
-        
+    
+    
     def _save_checkpoint(
         self,
         model: nn.Module,
@@ -538,13 +617,15 @@ class TwoTowerTrainer:
         n_genes: int,
         n_compounds: int,
         compound_names: list,
-        save_path: Path
+        save_path: Path,
+        scaffold_split: bool = False
     ):
         """Save model checkpoint."""
         checkpoint = {
             'model_state_dict': model.state_dict(),
             'fold_id': fold_id,
             'history': history,
+            'scaffold_split': scaffold_split,
             'dimensions': {
                 'input_size': n_genes,
                 'output_size': n_compounds,
