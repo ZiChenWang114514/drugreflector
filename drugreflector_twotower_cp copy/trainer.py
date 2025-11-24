@@ -117,13 +117,13 @@ class TwoTowerTrainer:
         
         if self.verbose:
             print(f"\n{'='*80}")
-            print(f"🚀 Two-Tower Trainer Initialized")
+            print(f"������ Two-Tower Trainer Initialized")
             print(f"{'='*80}")
             print(f"  Device: {self.device}")
             print(f"  Fusion: {self.fusion_method}")
             print(f"  Chem dim: {self.chem_hidden_dim}")
             print(f"  MPNN depth: {self.mpnn_depth}")
-            print(f"  Use 3D: {self.use_3d}")  # 🔥 新增
+            print(f"  Use 3D: {self.use_3d}")  # ������ 新增
             if self.use_3d:
                 print(f"  3D coord dim: {self.d_coord}")
                 print(f"  Conformer method: {self.conformer_method}")
@@ -171,7 +171,7 @@ class TwoTowerTrainer:
         
         if self.verbose:
             print(f"\n{'='*80}")
-            print(f"📊 Training Fold {fold_id}")
+            print(f"������ Training Fold {fold_id}")
             print(f"{'='*80}")
             print(f"  Total samples: {n_samples:,}")
             print(f"  Compounds: {n_compounds:,}")
@@ -193,7 +193,7 @@ class TwoTowerTrainer:
         )
         
         if self.verbose:
-            print(f"\n📋 Data Split:")
+            print(f"\n������ Data Split:")
             print(f"  Train: {len(train_dataset):,}")
             print(f"  Val: {len(val_dataset):,}")
         
@@ -221,7 +221,7 @@ class TwoTowerTrainer:
         
         if self.verbose:
             n_params = sum(p.numel() for p in model.parameters())
-            print(f"\n🏗️  Model:")
+            print(f"\n������️  Model:")
             print(f"  Parameters: {n_params:,}")
         
         # Setup training
@@ -348,31 +348,99 @@ class TwoTowerTrainer:
         }
     
     def _train_epoch(self, model, loader, criterion, optimizer):
-        """Train one epoch."""
+        """Train one epoch with robust error handling."""
         model.train()
         total_loss = 0.0
+        n_batches = 0
+        n_skipped = 0
         
-        for x_t, bmg, y in tqdm(loader, desc="Training", leave=False, 
-                                disable=not self.verbose):
-            x_t = x_t.to(self.device)
-            y = y.to(self.device)
-            
-            # 手动将 BatchMolGraph 的所有张量移到 GPU
-            if self.device == 'cuda':
-                bmg.V = bmg.V.to(self.device) if bmg.V is not None else None
-                bmg.E = bmg.E.to(self.device) if bmg.E is not None else None
-                bmg.edge_index = bmg.edge_index.to(self.device) if bmg.edge_index is not None else None
-                bmg.batch = bmg.batch.to(self.device) if bmg.batch is not None else None
-            
-            optimizer.zero_grad()
-            outputs = model(x_t, bmg)
-            loss = criterion(outputs, y)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
+        for batch_idx, batch_data in enumerate(tqdm(loader, desc="Training", 
+                                                    leave=False, 
+                                                    disable=not self.verbose)):
+            try:
+                x_t, bmg, y = batch_data
+                
+                # Pre-flight checks
+                if bmg is None:
+                    print(f"⚠️  Batch {batch_idx}: bmg is None")
+                    n_skipped += 1
+                    continue
+                
+                if not hasattr(bmg, 'V') or bmg.V is None:
+                    print(f"⚠️  Batch {batch_idx}: bmg.V is None")
+                    print(f"    bmg type: {type(bmg)}")
+                    print(f"    bmg attributes: {dir(bmg)}")
+                    n_skipped += 1
+                    continue
+                
+                if not hasattr(bmg, 'E') or bmg.E is None:
+                    print(f"⚠️  Batch {batch_idx}: bmg.E is None")
+                    n_skipped += 1
+                    continue
+                
+                # Move to device
+                x_t = x_t.to(self.device)
+                y = y.to(self.device)
+                
+                # Move BatchMolGraph safely
+                if self.device == 'cuda':
+                    try:
+                        if hasattr(bmg, 'to'):
+                            bmg = bmg.to(self.device)
+                        else:
+                            bmg.V = bmg.V.to(self.device)
+                            bmg.E = bmg.E.to(self.device)
+                            bmg.edge_index = bmg.edge_index.to(self.device)
+                            if hasattr(bmg, 'batch'):
+                                bmg.batch = bmg.batch.to(self.device)
+                            if hasattr(bmg, 'rev_edge_index'):
+                                bmg.rev_edge_index = bmg.rev_edge_index.to(self.device)
+                    except Exception as e:
+                        print(f"⚠️  Batch {batch_idx}: Error moving to GPU: {e}")
+                        n_skipped += 1
+                        continue
+                
+                # Forward pass with error handling
+                optimizer.zero_grad()
+                
+                try:
+                    outputs = model(x_t, bmg)
+                except Exception as e:
+                    print(f"⚠️  Batch {batch_idx}: Forward pass failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    n_skipped += 1
+                    continue
+                
+                # Backward pass
+                loss = criterion(outputs, y)
+                loss.backward()
+                
+                # Gradient clipping (optional, helps stability)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                total_loss += loss.item()
+                n_batches += 1
+                
+            except Exception as e:
+                print(f"⚠️  Batch {batch_idx}: Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
+                n_skipped += 1
+                continue
         
-        return total_loss / len(loader)
+        if n_batches == 0:
+            raise RuntimeError(
+                f"No valid batches processed! Skipped: {n_skipped}/{n_skipped + n_batches}"
+            )
+        
+        if n_skipped > 0:
+            print(f"  ⚠️  Skipped {n_skipped} batches this epoch")
+        
+        return total_loss / n_batches     
+
     
     def _validate_epoch(self, model, loader, criterion):
         """Validate one epoch."""
