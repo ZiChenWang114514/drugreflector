@@ -89,6 +89,13 @@ def main():
         help='Use RDKit fingerprints as fallback if Uni-Mol unavailable'
     )
     
+    parser.add_argument(
+        '--weights-dir',
+        type=str,
+        default=None,
+        help='Path to pre-downloaded Uni-Mol weights directory'
+    )
+    
     args = parser.parse_args()
     
     print(f"\n{'='*80}")
@@ -98,6 +105,8 @@ def main():
     print(f"  Output: {args.output}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Device: {args.device}")
+    if args.weights_dir:
+        print(f"  Weights dir: {args.weights_dir}")
     
     # Load compound info
     print(f"\n📖 Loading compound info...")
@@ -129,6 +138,7 @@ def main():
             model_name='unimol_base',
             device=args.device,
             batch_size=args.batch_size,
+            weights_dir=args.weights_dir,
         )
         use_unimol = True
     except ImportError as e:
@@ -149,10 +159,37 @@ def main():
             return
     
     # Encode compounds
+    print(f"\n{'='*80}")
+    print(f"🔬 Starting Molecular Encoding")
+    print(f"{'='*80}")
+    print(f"  Number of molecules: {len(valid_compounds):,}")
+    print(f"  Using: {'Uni-Mol' if use_unimol else 'RDKit'}")
+    
     smiles_list = valid_compounds[args.smiles_col].tolist()
     pert_ids = valid_compounds[args.pert_id_col].tolist()
     
-    embeddings, valid_mask = encoder.encode_smiles(smiles_list)
+    print(f"\n  First 3 SMILES to encode:")
+    for i, smiles in enumerate(smiles_list[:3]):
+        print(f"    {i+1}. {smiles[:60]}{'...' if len(smiles) > 60 else ''}")
+    
+    try:
+        print(f"\n  Calling encoder.encode_smiles()...")
+        embeddings, valid_mask = encoder.encode_smiles(smiles_list)
+        print(f"  ✅ Encoding returned successfully")
+        print(f"  Embeddings shape: {embeddings.shape}")
+        print(f"  Valid mask length: {len(valid_mask)}")
+    except Exception as e:
+        print(f"\n❌ ERROR during encoding:")
+        print(f"  {type(e).__name__}: {str(e)}")
+        import traceback
+        print("\nFull traceback:")
+        traceback.print_exc()
+        print(f"\n💡 Troubleshooting tips:")
+        print(f"  1. Run test_unimol.py to diagnose Uni-Mol issues")
+        print(f"  2. Try smaller batch size: --batch-size 8")
+        print(f"  3. Check SMILES validity in your data")
+        print(f"  4. Use --use-fallback for RDKit instead")
+        return
     
     # Build dictionary
     pert_to_embedding = {}

@@ -51,6 +51,9 @@ class UniMolEncoder:
         Batch size for encoding
     use_gpu : bool
         Whether to use GPU
+    weights_dir : str, optional
+        Directory containing pre-downloaded Uni-Mol weights
+        If provided, will use local weights instead of downloading
     """
     
     def __init__(
@@ -59,6 +62,7 @@ class UniMolEncoder:
         device: str = 'auto',
         batch_size: int = 32,
         use_gpu: bool = True,
+        weights_dir: Optional[str] = None,
     ):
         if not UNIMOL_AVAILABLE:
             raise ImportError(
@@ -71,6 +75,7 @@ class UniMolEncoder:
         
         self.model_name = model_name
         self.batch_size = batch_size
+        self.weights_dir = weights_dir
         
         if device == 'auto':
             import torch
@@ -87,9 +92,56 @@ class UniMolEncoder:
         print(f"  Device: {self.device}")
         print(f"  Batch size: {batch_size}")
         
+        # Set up weights directory if provided
+        if weights_dir:
+            weights_path = Path(weights_dir)
+            if not weights_path.exists():
+                raise FileNotFoundError(
+                    f"Weights directory not found: {weights_dir}\n"
+                    f"Please download weights using: python download_unimol_weights.py"
+                )
+            
+            print(f"  Weights dir: {weights_path.absolute()}")
+            
+            # Verify required files
+            required_files = ['mol_pre_all_h_220816.pt', 'mol.dict.txt']
+            missing_files = []
+            for filename in required_files:
+                if not (weights_path / filename).exists():
+                    missing_files.append(filename)
+            
+            if missing_files:
+                raise FileNotFoundError(
+                    f"Missing weight files in {weights_dir}:\n" +
+                    "\n".join(f"  - {f}" for f in missing_files) +
+                    f"\n\nPlease download weights using: python download_unimol_weights.py --output-dir {weights_dir}"
+                )
+            
+            # Set environment variable to use local weights
+            os.environ['UNIMOL_WEIGHT_DIR'] = str(weights_path.absolute())
+            print(f"  ✓ Using local weights")
+        
         # Initialize Uni-Mol
         # UniMolRepr data_type options: 'molecule', 'oled', 'protein', 'crystal'
-        self.encoder = UniMolRepr(data_type='molecule', remove_hs=False)
+        try:
+            self.encoder = UniMolRepr(data_type='molecule', remove_hs=False)
+        except Exception as e:
+            error_msg = (
+                f"Failed to initialize Uni-Mol encoder: {e}\n\n"
+                f"This may be due to:\n"
+                f"  1. Missing model weights\n"
+                f"  2. No internet connection to download weights\n"
+                f"  3. Corrupted weight files\n\n"
+                f"Solution:\n"
+                f"  1. Download weights on a machine with internet:\n"
+                f"     python download_unimol_weights.py --output-dir ./unimol_weights\n\n"
+                f"  2. Transfer to HPC:\n"
+                f"     scp -r ./unimol_weights user@hpc:/path/to/weights\n\n"
+                f"  3. Use with --weights-dir:\n"
+                f"     python precompute_mol_embeddings.py --weights-dir /path/to/weights ...\n\n"
+                f"  Or use fallback: python precompute_mol_embeddings.py --use-fallback ..."
+            )
+            raise RuntimeError(error_msg)
         
         # Embedding dimension
         self.embedding_dim = 512  # Uni-Mol base output dim
@@ -123,53 +175,141 @@ class UniMolEncoder:
         valid_mask = [True] * n_molecules
         
         print(f"\n📊 Encoding {n_molecules:,} molecules...")
+        print(f"  Batch size: {self.batch_size}")
         
         # Process in batches
         n_batches = (n_molecules + self.batch_size - 1) // self.batch_size
+        print(f"  Number of batches: {n_batches}")
         
         iterator = range(0, n_molecules, self.batch_size)
         if show_progress:
             iterator = tqdm(iterator, total=n_batches, desc="Encoding")
         
-        for start_idx in iterator:
+        n_failed_batches = 0
+        n_failed_molecules = 0
+        
+        for batch_num, start_idx in enumerate(iterator):
             end_idx = min(start_idx + self.batch_size, n_molecules)
             batch_smiles = smiles_list[start_idx:end_idx]
             
+            # Debug: print first batch info
+            if batch_num == 0:
+                print(f"\n  Processing first batch ({len(batch_smiles)} molecules)...")
+                print(f"  First SMILES: {batch_smiles[0][:50]}...")
+            
             try:
                 # Get representations using Uni-Mol
-                # Returns dict with 'cls_repr' (CLS token embedding) and 'atomic_reprs'
+                # NOTE: get_repr() may return either dict or list depending on version
                 reprs = self.encoder.get_repr(batch_smiles, return_atomic_reprs=False)
                 
-                # Use CLS representation
-                batch_embeddings = reprs['cls_repr']
+                # Debug: check reprs structure
+                if batch_num == 0:
+                    print(f"  ✓ Got representations")
+                    print(f"  Type of reprs: {type(reprs)}")
                 
-                # Handle numpy array
+                # Handle different return types
+                if isinstance(reprs, dict):
+                    # Dictionary format: {'cls_repr': tensor, ...}
+                    if batch_num == 0:
+                        print(f"  Format: Dictionary")
+                        print(f"  Keys: {list(reprs.keys())}")
+                    
+                    if 'cls_repr' in reprs:
+                        batch_embeddings = reprs['cls_repr']
+                    else:
+                        # Try alternative keys
+                        for key in ['repr', 'embedding', 'output', 'features']:
+                            if key in reprs:
+                                if batch_num == 0:
+                                    print(f"  Using alternative key: '{key}'")
+                                batch_embeddings = reprs[key]
+                                break
+                        else:
+                            raise KeyError(f"Cannot find embedding in dict keys: {list(reprs.keys())}")
+                
+                elif isinstance(reprs, (list, tuple)):
+                    # List/Tuple format: [cls_repr, atomic_reprs] or just [cls_repr]
+                    if batch_num == 0:
+                        print(f"  Format: List/Tuple with {len(reprs)} elements")
+                        for i, item in enumerate(reprs):
+                            print(f"    Element {i}: type={type(item)}", end="")
+                            if hasattr(item, 'shape'):
+                                print(f", shape={item.shape}", end="")
+                            print()
+                    
+                    # CLS representation is typically the first element
+                    batch_embeddings = reprs[0]
+                    
+                else:
+                    # Unknown format
+                    raise TypeError(f"Unexpected reprs type: {type(reprs)}")
+                
+                # Convert to numpy array
                 if isinstance(batch_embeddings, np.ndarray):
                     embeddings[start_idx:end_idx] = batch_embeddings
                 else:
-                    embeddings[start_idx:end_idx] = batch_embeddings.cpu().numpy()
+                    # Assume torch tensor
+                    import torch
+                    if isinstance(batch_embeddings, torch.Tensor):
+                        embeddings[start_idx:end_idx] = batch_embeddings.detach().cpu().numpy()
+                    else:
+                        # Try to convert
+                        embeddings[start_idx:end_idx] = np.array(batch_embeddings)
+                
+                if batch_num == 0:
+                    print(f"  ✓ Successfully encoded first batch")
+                    print(f"  Embedding shape: {embeddings[start_idx:end_idx].shape}")
+                    print(f"  Embedding dtype: {embeddings[start_idx:end_idx].dtype}")
+                    print(f"  First embedding (first 5 values): {embeddings[start_idx][:5]}")
                     
             except Exception as e:
+                n_failed_batches += 1
+                print(f"\n  ⚠ Batch {batch_num} failed (indices {start_idx}-{end_idx}): {str(e)}")
+                print(f"  Attempting to process molecules individually...")
+                
                 # Process one by one to identify failures
                 for i, smiles in enumerate(batch_smiles):
                     idx = start_idx + i
                     try:
                         repr_single = self.encoder.get_repr([smiles], return_atomic_reprs=False)
-                        emb = repr_single['cls_repr']
-                        if isinstance(emb, np.ndarray):
-                            embeddings[idx] = emb[0]
+                        
+                        # Handle dict or list return
+                        if isinstance(repr_single, dict):
+                            emb = repr_single.get('cls_repr', repr_single.get('repr', None))
+                        elif isinstance(repr_single, (list, tuple)):
+                            emb = repr_single[0]
                         else:
-                            embeddings[idx] = emb[0].cpu().numpy()
+                            raise TypeError(f"Unexpected type: {type(repr_single)}")
+                        
+                        # Convert to numpy
+                        if isinstance(emb, np.ndarray):
+                            embeddings[idx] = emb[0] if len(emb.shape) > 1 else emb
+                        else:
+                            import torch
+                            if isinstance(emb, torch.Tensor):
+                                emb_np = emb.detach().cpu().numpy()
+                                embeddings[idx] = emb_np[0] if len(emb_np.shape) > 1 else emb_np
+                            else:
+                                embeddings[idx] = np.array(emb)[0]
+                                
                     except Exception as e2:
                         valid_mask[idx] = False
+                        n_failed_molecules += 1
+                        if n_failed_molecules <= 5:  # Only print first 5 failures
+                            print(f"    ✗ Failed molecule {idx}: {smiles[:30]}... Error: {str(e2)[:50]}")
                         warnings.warn(f"Failed to encode SMILES at index {idx}: {str(e2)[:50]}")
         
         n_valid = sum(valid_mask)
         n_failed = n_molecules - n_valid
         
-        print(f"  ✓ Encoded: {n_valid:,} molecules")
-        if n_failed > 0:
-            print(f"  ⚠️ Failed: {n_failed:,} molecules")
+        print(f"\n{'='*60}")
+        print(f"📊 ENCODING SUMMARY")
+        print(f"{'='*60}")
+        print(f"  Total molecules: {n_molecules:,}")
+        print(f"  Successfully encoded: {n_valid:,} ({100*n_valid/n_molecules:.1f}%)")
+        print(f"  Failed: {n_failed:,} ({100*n_failed/n_molecules:.1f}%)")
+        print(f"  Failed batches: {n_failed_batches}")
+        print(f"{'='*60}\n")
         
         return embeddings, valid_mask
     
@@ -248,6 +388,7 @@ def precompute_unimol_embeddings(
     smiles_col: str = 'canonical_smiles',
     batch_size: int = 32,
     device: str = 'auto',
+    weights_dir: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Convenience function to precompute Uni-Mol embeddings from compound info file.
@@ -266,6 +407,8 @@ def precompute_unimol_embeddings(
         Batch size for encoding
     device : str
         Device ('cuda', 'cpu', 'auto')
+    weights_dir : str, optional
+        Path to pre-downloaded Uni-Mol weights directory
     
     Returns
     -------
@@ -286,6 +429,7 @@ def precompute_unimol_embeddings(
         model_name='unimol_base',
         device=device,
         batch_size=batch_size,
+        weights_dir=weights_dir,
     )
     
     # Encode
@@ -393,6 +537,8 @@ if __name__ == "__main__":
                        help='Output path for embeddings pickle')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--device', type=str, default='auto')
+    parser.add_argument('--weights-dir', type=str, default=None,
+                       help='Path to pre-downloaded Uni-Mol weights directory')
     
     args = parser.parse_args()
     
@@ -401,4 +547,5 @@ if __name__ == "__main__":
         output_path=args.output,
         batch_size=args.batch_size,
         device=args.device,
+        weights_dir=args.weights_dir,
     )
