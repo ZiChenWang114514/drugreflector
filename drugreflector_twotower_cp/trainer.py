@@ -1,0 +1,439 @@
+"""
+Two-Tower DrugReflector Trainer
+"""
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, top_k_accuracy_score
+import matplotlib.pyplot as plt
+
+from models import TowTowerModel
+from dataset import TwoTowerDataset, collate_two_tower
+from preprocessing import clip_and_normalize_signature
+
+
+def compound_level_topk_recall(labels, probs, k):
+    """Compute compound-level top-k recall."""
+    labels = np.asarray(labels)
+    probs = np.asarray(probs)
+    n_classes = probs.shape[1]
+    k = max(1, min(k, n_classes))
+
+    topk_pred = np.argpartition(-probs, kth=k-1, axis=1)[:, :k]
+    hit_per_sample = (topk_pred == labels[:, None]).any(axis=1).astype(float)
+
+    compound_hits = {}
+    compound_counts = {}
+    for y, hit in zip(labels, hit_per_sample):
+        compound_hits.setdefault(y, 0.0)
+        compound_counts.setdefault(y, 0)
+        compound_hits[y] += hit
+        compound_counts[y] += 1
+
+    compound_recalls = [compound_hits[cid] / compound_counts[cid] 
+                       for cid in compound_hits]
+    return float(np.mean(compound_recalls))
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for class imbalance."""
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+        
+        return focal_loss.mean()
+
+
+class TwoTowerTrainer:
+    """
+    Trainer for Two-Tower DrugReflector.
+    
+    Parameters match original trainer for consistency.
+    """
+    
+    def __init__(
+        self,
+        device: str = 'auto',
+        chem_hidden_dim: int = 512,
+        transcript_hidden_dims: List[int] = [1024, 2048],
+        fusion_method: str = 'concat',
+        mpnn_depth: int = 3,
+        mpnn_dropout: float = 0.0,
+        initial_lr: float = 0.0139,
+        min_lr: float = 0.00001,
+        weight_decay: float = 1e-5,
+        t_0: int = 20,
+        focal_gamma: float = 2.0,
+        batch_size: int = 256,
+        num_epochs: int = 50,
+        num_workers: int = 4,
+        save_every: int = 10,
+        verbose: bool = True
+    ):
+        if device == 'auto':
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+        
+        self.chem_hidden_dim = chem_hidden_dim
+        self.transcript_hidden_dims = transcript_hidden_dims
+        self.fusion_method = fusion_method
+        self.mpnn_depth = mpnn_depth
+        self.mpnn_dropout = mpnn_dropout
+        self.initial_lr = initial_lr
+        self.min_lr = min_lr
+        self.weight_decay = weight_decay
+        self.t_0 = t_0
+        self.focal_gamma = focal_gamma
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.num_workers = num_workers
+        self.save_every = save_every
+        self.verbose = verbose
+        
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print(f"🚀 Two-Tower Trainer Initialized")
+            print(f"{'='*80}")
+            print(f"  Device: {self.device}")
+            print(f"  Fusion: {self.fusion_method}")
+            print(f"  Chem dim: {self.chem_hidden_dim}")
+            print(f"  MPNN depth: {self.mpnn_depth}")
+    
+    def create_model(self, input_size: int, output_size: int) -> nn.Module:
+        """Create Two-Tower model."""
+        model = TwoTowerModel(
+            n_genes=input_size,
+            n_compounds=output_size,
+            chem_hidden_dim=self.chem_hidden_dim,
+            transcript_hidden_dims=self.transcript_hidden_dims,
+            fusion_method=self.fusion_method,
+            mpnn_depth=self.mpnn_depth,
+            mpnn_dropout=self.mpnn_dropout
+        )
+        return model
+    
+    def train_single_fold(
+        self,
+        training_data: Dict,
+        fold_id: int,
+        output_dir: Path
+    ) -> Dict:
+        """Train model on single fold."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract data
+        X = training_data['X']
+        y = training_data['y']
+        folds = training_data['folds']
+        compound_names = training_data['compound_names']
+        smiles_dict = training_data['smiles_dict']
+        
+        # Get compound IDs for each sample
+        sample_meta = training_data['sample_meta']
+        compound_ids = sample_meta['pert_id'].values
+        
+        n_samples = len(X)
+        n_genes = X.shape[1]
+        n_compounds = len(compound_names)
+        
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print(f"📊 Training Fold {fold_id}")
+            print(f"{'='*80}")
+            print(f"  Total samples: {n_samples:,}")
+            print(f"  Compounds: {n_compounds:,}")
+            print(f"  Genes: {n_genes}")
+        
+        # Preprocess
+        X_processed = clip_and_normalize_signature(X)
+        
+        # Create train/val split
+        val_mask = folds == fold_id
+        train_mask = ~val_mask
+        
+        # Create datasets
+        train_dataset = TwoTowerDataset(
+            X_processed, y, compound_ids, smiles_dict, train_mask
+        )
+        val_dataset = TwoTowerDataset(
+            X_processed, y, compound_ids, smiles_dict, val_mask
+        )
+        
+        if self.verbose:
+            print(f"\n📋 Data Split:")
+            print(f"  Train: {len(train_dataset):,}")
+            print(f"  Val: {len(val_dataset):,}")
+        
+        # Create loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            collate_fn=collate_two_tower,
+            pin_memory=(self.device == 'cuda')
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=collate_two_tower,
+            pin_memory=(self.device == 'cuda')
+        )
+        
+        # Create model
+        model = self.create_model(n_genes, n_compounds).to(self.device)
+        
+        if self.verbose:
+            n_params = sum(p.numel() for p in model.parameters())
+            print(f"\n🏗️  Model:")
+            print(f"  Parameters: {n_params:,}")
+        
+        # Setup training
+        criterion = FocalLoss(gamma=self.focal_gamma)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay
+        )
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer, T_0=self.t_0, eta_min=self.min_lr
+        )
+        
+        # Training history
+        history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_recall': [],
+            'val_top1_acc': [],
+            'val_top10_acc': [],
+            'learning_rates': []
+        }
+        
+        best_recall = 0.0
+        best_epoch = 0
+        best_model_state = None
+        
+        # Training loop
+        for epoch in range(self.num_epochs):
+            epoch_start = time.time()
+            
+            # Train
+            train_loss = self._train_epoch(
+                model, train_loader, criterion, optimizer
+            )
+            
+            # Validate
+            val_loss, val_metrics = self._validate_epoch(
+                model, val_loader, criterion
+            )
+            
+            # Record
+            current_lr = optimizer.param_groups[0]['lr']
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['val_recall'].append(val_metrics['recall'])
+            history['val_top1_acc'].append(val_metrics['top1_acc'])
+            history['val_top10_acc'].append(val_metrics['top10_acc'])
+            history['learning_rates'].append(current_lr)
+            
+            if self.verbose:
+                print(f"\nEpoch {epoch+1}/{self.num_epochs} ({time.time()-epoch_start:.1f}s)")
+                print(f"  Train Loss: {train_loss:.4f}")
+                print(f"  Val Loss: {val_loss:.4f}")
+                print(f"  Val Recall: {val_metrics['recall']:.4f} ⭐")
+                print(f"  Val Top-1: {val_metrics['top1_acc']:.4f}")
+                print(f"  LR: {current_lr:.6f}")
+            
+            # Save best
+            if val_metrics['recall'] > best_recall:
+                best_recall = val_metrics['recall']
+                best_epoch = epoch
+                best_model_state = model.state_dict().copy()
+                if self.verbose:
+                    print(f"  ✅ New best!")
+            
+            scheduler.step()
+        
+        # Load best
+        if best_model_state:
+            model.load_state_dict(best_model_state)
+        
+        # Save final model
+        model_path = output_dir / f"model_fold_{fold_id}.pt"
+        self._save_checkpoint(
+            model, fold_id, history, n_genes, n_compounds,
+            compound_names, model_path
+        )
+        
+        if self.verbose:
+            print(f"\n✅ Training Complete!")
+            print(f"  Best epoch: {best_epoch+1}")
+            print(f"  Best recall: {best_recall:.4f}")
+            print(f"  Model: {model_path}")
+        
+        return {
+            'model': model,
+            'history': history,
+            'best_recall': best_recall,
+            'best_epoch': best_epoch,
+            'model_path': model_path
+        }
+    
+    def train_all_folds(
+        self,
+        training_data: Dict,
+        output_dir: Path,
+        folds: Optional[List[int]] = None
+    ) -> Dict:
+        """Train on all folds."""
+        if folds is None:
+            folds = [0, 1, 2]
+        
+        fold_results = {}
+        model_paths = []
+        
+        for fold_id in folds:
+            result = self.train_single_fold(
+                training_data, fold_id, output_dir
+            )
+            fold_results[fold_id] = result
+            model_paths.append(str(result['model_path']))
+        
+        # Ensemble metrics
+        ensemble_metrics = {
+            'mean_recall': np.mean([r['best_recall'] for r in fold_results.values()]),
+            'std_recall': np.std([r['best_recall'] for r in fold_results.values()])
+        }
+        
+        return {
+            'fold_results': fold_results,
+            'ensemble_metrics': ensemble_metrics,
+            'model_paths': model_paths
+        }
+    
+    def _train_epoch(self, model, loader, criterion, optimizer):
+        """Train one epoch."""
+        model.train()
+        total_loss = 0.0
+        
+        for x_t, bmg, y in tqdm(loader, desc="Training", leave=False, 
+                                disable=not self.verbose):
+            x_t = x_t.to(self.device)
+            y = y.to(self.device)
+            bmg = bmg.to(self.device)
+            
+            optimizer.zero_grad()
+            outputs = model(x_t, bmg)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        return total_loss / len(loader)
+    
+    def _validate_epoch(self, model, loader, criterion):
+        """Validate one epoch."""
+        model.eval()
+        total_loss = 0.0
+        all_preds = []
+        all_labels = []
+        all_probs = []
+        
+        with torch.no_grad():
+            for x_t, bmg, y in tqdm(loader, desc="Validating", leave=False,
+                                   disable=not self.verbose):
+                x_t = x_t.to(self.device)
+                y = y.to(self.device)
+                bmg = bmg.to(self.device)
+                
+                outputs = model(x_t, bmg)
+                loss = criterion(outputs, y)
+                total_loss += loss.item()
+                
+                probs = F.softmax(outputs, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(y.cpu().numpy())
+                all_probs.append(probs.cpu().numpy())
+        
+        avg_loss = total_loss / len(loader)
+        
+        all_preds = np.concatenate(all_preds)
+        all_labels = np.concatenate(all_labels)
+        all_probs = np.concatenate(all_probs)
+        
+        top1_acc = accuracy_score(all_labels, all_preds)
+        top10_acc = top_k_accuracy_score(all_labels, all_probs, k=10)
+        
+        top1_percent_k = max(1, int(0.01 * all_probs.shape[1]))
+        recall = compound_level_topk_recall(all_labels, all_probs, top1_percent_k)
+        
+        return avg_loss, {
+            'recall': recall,
+            'top1_acc': top1_acc,
+            'top10_acc': top10_acc
+        }
+    
+    def _save_checkpoint(
+        self,
+        model: nn.Module,
+        fold_id: int,
+        history: Dict,
+        n_genes: int,
+        n_compounds: int,
+        compound_names: list,
+        save_path: Path
+    ):
+        """Save model checkpoint."""
+        checkpoint = {
+            'model_state_dict': model.state_dict(),
+            'fold_id': fold_id,
+            'history': history,
+            'dimensions': {
+                'input_size': n_genes,
+                'output_size': n_compounds,
+                'output_names': list(compound_names)
+            },
+            'architecture': {
+                'chem_hidden_dim': self.chem_hidden_dim,
+                'transcript_hidden_dims': self.transcript_hidden_dims,
+                'fusion_method': self.fusion_method,
+                'mpnn_depth': self.mpnn_depth,
+                'mpnn_dropout': self.mpnn_dropout
+            },
+            'training_config': {
+                'initial_lr': self.initial_lr,
+                'min_lr': self.min_lr,
+                'weight_decay': self.weight_decay,
+                't_0': self.t_0,
+                'focal_gamma': self.focal_gamma,
+                'batch_size': self.batch_size,
+                'num_epochs': self.num_epochs
+            }
+        }
+        torch.save(checkpoint, save_path)

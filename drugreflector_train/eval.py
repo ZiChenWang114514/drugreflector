@@ -39,9 +39,8 @@ except NameError:
     import os
     sys.path.append(str(Path(os.getcwd()).parent))
 
-from models import nnFC
-from dataset import LINCSDataset
-from preprocessing import clip_and_normalize_signature
+from drugreflector.models import nnFC
+from drugreflector_training import LINCSDataset, clip_and_normalize_signature
 
 
 def compound_level_topk_recall(labels, probs, k):
