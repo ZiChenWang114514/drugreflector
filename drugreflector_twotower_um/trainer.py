@@ -480,6 +480,7 @@ class TwoTowerTrainer:
             'contrastive': total_contrastive / n_batches,
         }
     
+    # ===== 修改后 =====
     def _validate_epoch(
         self,
         model: nn.Module,
@@ -525,44 +526,44 @@ class TwoTowerTrainer:
         n_classes_in_val = len(unique_labels)
         n_classes_total = all_probs.shape[1]
         
-        # Top-1 accuracy
+        # Top-1 accuracy - 直接计算，不需要特殊处理
         top1_acc = accuracy_score(all_labels, all_preds)
         
-        # Top-10 accuracy: consider number of classes in validation set
+        # Top-10 accuracy: 需要特殊处理 scaffold/cold start split
         k_for_top10 = min(10, n_classes_in_val)
         
         if n_classes_in_val < n_classes_total:
             # Scaffold/Cold Start split情况：验证集类别少于总类别
-            # 提取验证集类别对应的概率
+            # 打印一次提示信息
+            if self.verbose and not hasattr(self, '_val_class_warning_shown'):
+                print(f"\n  ℹ️  Validation set contains {n_classes_in_val}/{n_classes_total} classes (scaffold/cold-start split)")
+                self._val_class_warning_shown = True
+            
+            # 创建标签映射：将原始标签映射到 0 到 n_classes_in_val-1
+            label_to_new_idx = {old_label: new_idx for new_idx, old_label in enumerate(unique_labels)}
+            remapped_labels = np.array([label_to_new_idx[label] for label in all_labels])
+            
+            # 提取验证集类别对应的概率，并重新排列
             probs_subset = all_probs[:, unique_labels]
             
-            # 使用子集概率计算top-k accuracy
+            # 使用重新映射的标签和子集概率计算 top-k accuracy
             top10_acc = top_k_accuracy_score(
-                all_labels, 
-                probs_subset, 
-                k=k_for_top10,
-                labels=unique_labels  # Explicitly specify classes
+                remapped_labels,  # 使用映射后的标签 [0, n_classes_in_val-1]
+                probs_subset,     # 使用对应的概率子集
+                k=k_for_top10
             )
-            
-            if self.verbose and n_classes_in_val < n_classes_total:
-                # Only print once during first validation
-                if not hasattr(self, '_val_class_warning_shown'):
-                    print(f"\n  ℹ️  Validation set contains {n_classes_in_val}/{n_classes_total} classes (scaffold/cold-start split)")
-                    self._val_class_warning_shown = True
         else:
-            # Original case: validation set contains all classes
+            # 原始情况：验证集包含所有类别
             top10_acc = top_k_accuracy_score(all_labels, all_probs, k=k_for_top10)
         
-        # Recall calculation: use actual number of classes in validation set
+        # Recall calculation: 使用重新映射的标签
         top1_percent_k = max(1, int(0.01 * n_classes_in_val))
         
-        # Use subset probabilities for recall calculation
         if n_classes_in_val < n_classes_total:
-            probs_for_recall = all_probs[:, unique_labels]
+            # 使用重新映射的标签计算 recall
+            recall = compound_level_topk_recall(remapped_labels, probs_subset, top1_percent_k)
         else:
-            probs_for_recall = all_probs
-        
-        recall = compound_level_topk_recall(all_labels, probs_for_recall, top1_percent_k)
+            recall = compound_level_topk_recall(all_labels, all_probs, top1_percent_k)
         
         return avg_loss, {
             'recall': recall,
