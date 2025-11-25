@@ -318,7 +318,9 @@ class TwoTowerTrainer:
         self._save_checkpoint(
             model, fold_id, history, n_genes, n_compounds,
             compound_names, model_path,
-            scaffold_split=training_data.get('scaffold_split', False)
+            scaffold_split=training_data.get('scaffold_split', False),
+            cold_start_split=training_data.get('cold_start_split', False),
+            cold_start_ratio=training_data.get('cold_start_ratio', None)
         )
         
         if self.verbose:
@@ -618,7 +620,9 @@ class TwoTowerTrainer:
         n_compounds: int,
         compound_names: list,
         save_path: Path,
-        scaffold_split: bool = False
+        scaffold_split: bool = False,
+        cold_start_split: bool = False,
+        cold_start_ratio: Optional[float] = None
     ):
         """Save model checkpoint."""
         checkpoint = {
@@ -626,6 +630,8 @@ class TwoTowerTrainer:
             'fold_id': fold_id,
             'history': history,
             'scaffold_split': scaffold_split,
+            'cold_start_split': cold_start_split,
+            'cold_start_ratio': cold_start_ratio,
             'dimensions': {
                 'input_size': n_genes,
                 'output_size': n_compounds,

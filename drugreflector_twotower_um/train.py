@@ -126,6 +126,35 @@ def main():
         default=42,
         help='Random seed for scaffold splitting'
     )
+    
+    # ===== Cold Start Split Options ===== (新增)
+    parser.add_argument(
+        '--use-cold-start-split',
+        action='store_true',
+        help='Use cold start split (hybrid of random and scaffold)'
+    )
+
+    parser.add_argument(
+        '--cold-start-ratio',
+        type=float,
+        default=0.3,
+        help='Proportion of compounds to reserve as cold start (unseen in training)'
+    )
+
+    parser.add_argument(
+        '--cold-start-folds',
+        type=int,
+        default=3,
+        help='Number of cold start folds (only with --use-cold-start-split)'
+    )
+
+    parser.add_argument(
+        '--cold-start-seed',
+        type=int,
+        default=42,
+        help='Random seed for cold start splitting'
+    )
+
     # ===== Model Architecture =====
     parser.add_argument(
         '--embedding-dim',
@@ -260,8 +289,53 @@ def main():
         filter_missing_mol=True,
     )
     
-    # ===== Apply scaffold split if requested ===== (新增)
-    if args.use_scaffold_split:
+    # ===== Apply split strategy ===== (修改)
+    if args.use_cold_start_split:
+        from scaffold_split import create_cold_start_folds
+        
+        print(f"\n{'='*80}")
+        print(f"🧬 Creating Cold Start Splits")
+        print(f"{'='*80}")
+        
+        sample_meta = training_data['sample_meta']
+        
+        # 需要 SMILES 字典
+        if 'smiles_dict' not in training_data or 'pert_to_mol_embedding' not in training_data:
+            if not args.compound_info:
+                raise ValueError(
+                    "When using --use-cold-start-split, either:\n"
+                    "  1. Ensure training_data contains 'smiles_dict', or\n"
+                    "  2. Provide --compound-info argument"
+                )
+            
+            import pandas as pd
+            compound_info = pd.read_csv(args.compound_info, sep='\t')
+            smiles_dict = dict(zip(
+                compound_info['pert_id'],
+                compound_info['canonical_smiles']
+            ))
+            training_data['smiles_dict'] = smiles_dict
+        else:
+            smiles_dict = training_data.get('smiles_dict', {})
+        
+        # Create cold start folds
+        cold_start_folds = create_cold_start_folds(
+            sample_meta=sample_meta,
+            smiles_dict=smiles_dict,
+            pert_id_col='pert_id',
+            n_folds=args.cold_start_folds,
+            cold_start_ratio=args.cold_start_ratio,
+            seed=args.cold_start_seed
+        )
+        
+        # Replace original folds
+        training_data['folds'] = cold_start_folds
+        training_data['cold_start_split'] = True
+        training_data['cold_start_ratio'] = args.cold_start_ratio
+        
+        print(f"  ✓ Replaced original folds with cold start splits")
+
+    elif args.use_scaffold_split:
         from scaffold_split import create_scaffold_folds
         
         print(f"\n{'='*80}")
@@ -272,7 +346,6 @@ def main():
         
         # 需要 SMILES 字典
         if 'smiles_dict' not in training_data or 'pert_to_mol_embedding' not in training_data:
-            # 如果没有 smiles_dict，从 compound_info 加载
             if not args.compound_info:
                 raise ValueError(
                     "When using --use-scaffold-split, either:\n"
@@ -304,8 +377,10 @@ def main():
         training_data['scaffold_split'] = True
         
         print(f"  ✓ Replaced original folds with scaffold-based splits")
+
     else:
         training_data['scaffold_split'] = False
+        training_data['cold_start_split'] = False
     
     # Create trainer
     trainer = TwoTowerTrainer(

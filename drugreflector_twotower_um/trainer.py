@@ -329,11 +329,17 @@ class TwoTowerTrainer:
             # Periodic checkpoint
             if (epoch + 1) % self.save_every == 0:
                 checkpoint_path = output_dir / f"checkpoint_fold{fold_id}_epoch{epoch+1}.pt"
+                scaffold_split = training_data.get('scaffold_split', False)
+                cold_start_split = training_data.get('cold_start_split', False)
+                cold_start_ratio = training_data.get('cold_start_ratio', None)
                 self._save_checkpoint(
                     model, fold_id, epoch, history,
                     n_genes, n_compounds, mol_dim,
                     gene_names, compound_names,
                     checkpoint_path,
+                    scaffold_split=scaffold_split,
+                    cold_start_split=cold_start_split,
+                    cold_start_ratio=cold_start_ratio,
                 )
             
             # Update learning rate
@@ -351,16 +357,19 @@ class TwoTowerTrainer:
         
         # Save final model
         model_path = output_dir / f"twotower_fold_{fold_id}.pt"
-        model_path = output_dir / f"twotower_fold_{fold_id}.pt"
         scaffold_split = training_data.get('scaffold_split', False)
+        cold_start_split = training_data.get('cold_start_split', False)
+        cold_start_ratio = training_data.get('cold_start_ratio', None)
         self._save_checkpoint(
             model, fold_id, self.num_epochs - 1, history,
             n_genes, n_compounds, mol_dim,
             gene_names, compound_names,
             model_path,
-            scaffold_split=scaffold_split,  
+            scaffold_split=scaffold_split,
+            cold_start_split=cold_start_split,
+            cold_start_ratio=cold_start_ratio,
         )
-        
+                
         # Plot training curves
         self._plot_training_curves(history, output_dir, fold_id)
         
@@ -511,11 +520,49 @@ class TwoTowerTrainer:
         all_labels = np.concatenate(all_labels)
         all_probs = np.concatenate(all_probs)
         
-        top1_acc = accuracy_score(all_labels, all_preds)
-        top10_acc = top_k_accuracy_score(all_labels, all_probs, k=min(10, all_probs.shape[1]))
+        # 获取验证集中实际出现的类别
+        unique_labels = np.unique(all_labels)
+        n_classes_in_val = len(unique_labels)
+        n_classes_total = all_probs.shape[1]
         
-        top1_percent_k = max(1, int(0.01 * all_probs.shape[1]))
-        recall = compound_level_topk_recall(all_labels, all_probs, top1_percent_k)
+        # Top-1 accuracy
+        top1_acc = accuracy_score(all_labels, all_preds)
+        
+        # Top-10 accuracy: consider number of classes in validation set
+        k_for_top10 = min(10, n_classes_in_val)
+        
+        if n_classes_in_val < n_classes_total:
+            # Scaffold/Cold Start split情况：验证集类别少于总类别
+            # 提取验证集类别对应的概率
+            probs_subset = all_probs[:, unique_labels]
+            
+            # 使用子集概率计算top-k accuracy
+            top10_acc = top_k_accuracy_score(
+                all_labels, 
+                probs_subset, 
+                k=k_for_top10,
+                labels=unique_labels  # Explicitly specify classes
+            )
+            
+            if self.verbose and n_classes_in_val < n_classes_total:
+                # Only print once during first validation
+                if not hasattr(self, '_val_class_warning_shown'):
+                    print(f"\n  ℹ️  Validation set contains {n_classes_in_val}/{n_classes_total} classes (scaffold/cold-start split)")
+                    self._val_class_warning_shown = True
+        else:
+            # Original case: validation set contains all classes
+            top10_acc = top_k_accuracy_score(all_labels, all_probs, k=k_for_top10)
+        
+        # Recall calculation: use actual number of classes in validation set
+        top1_percent_k = max(1, int(0.01 * n_classes_in_val))
+        
+        # Use subset probabilities for recall calculation
+        if n_classes_in_val < n_classes_total:
+            probs_for_recall = all_probs[:, unique_labels]
+        else:
+            probs_for_recall = all_probs
+        
+        recall = compound_level_topk_recall(all_labels, probs_for_recall, top1_percent_k)
         
         return avg_loss, {
             'recall': recall,
@@ -536,6 +583,8 @@ class TwoTowerTrainer:
         compound_names: list,
         save_path: Path,
         scaffold_split: bool = False,
+        cold_start_split: bool = False,
+        cold_start_ratio: Optional[float] = None,
     ):
         """Save model checkpoint."""
         checkpoint = {
@@ -544,6 +593,8 @@ class TwoTowerTrainer:
             'epoch': epoch,
             'history': history,
             'scaffold_split': scaffold_split,
+            'cold_start_split': cold_start_split,
+            'cold_start_ratio': cold_start_ratio,
             'dimensions': {
                 'input_size': n_genes,
                 'output_size': n_compounds,

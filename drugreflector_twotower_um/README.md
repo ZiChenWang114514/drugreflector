@@ -108,3 +108,36 @@ drugreflector_train_twotower/
     ├── train_ensemble.sh
     └── train_single_fold.sh
 ```
+
+
+# 使用cold start split训练（30%化合物为cold start）
+python train.py \
+    --data-file ../datasets/training_data_lincs2020_final.pkl \
+    --mol-embeddings ../datasets/mol_embeddings_unimol.pkl \
+    --output-dir ../models/twotower_cold_start_30pct \
+    --use-cold-start-split \
+    --cold-start-ratio 0.3 \
+    --cold-start-folds 3 \
+    --all-folds \
+    --embedding-dim 512 \
+    --fusion-type concat \
+    --epochs 50
+
+# 使用更严格的cold start（50%化合物）
+python train.py \
+    --data-file ../datasets/training_data_lincs2020_final.pkl \
+    --mol-embeddings ../datasets/mol_embeddings_unimol.pkl \
+    --output-dir ../models/twotower_cold_start_50pct \
+    --use-cold-start-split \
+    --cold-start-ratio 0.5 \
+    --all-folds
+
+# 如果需要compound_info来获取SMILES
+python train.py \
+    --data-file ../datasets/training_data_lincs2020_final.pkl \
+    --mol-embeddings ../datasets/mol_embeddings_unimol.pkl \
+    --compound-info ../datasets/LINCS2020/compoundinfo_beta.txt \
+    --output-dir ../models/twotower_cold_start \
+    --use-cold-start-split \
+    --cold-start-ratio 0.3 \
+    --all-folds
