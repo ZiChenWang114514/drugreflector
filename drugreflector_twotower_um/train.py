@@ -106,6 +106,26 @@ def main():
         help='Train specific folds (e.g., --folds 0 1)'
     )
     
+    # ===== Scaffold Split Options ===== 
+    parser.add_argument(
+        '--use-scaffold-split',
+        action='store_true',
+        help='Use scaffold-based split instead of random folds'
+    )
+    
+    parser.add_argument(
+        '--scaffold-folds',
+        type=int,
+        default=3,
+        help='Number of scaffold-based folds (only with --use-scaffold-split)'
+    )
+    
+    parser.add_argument(
+        '--scaffold-seed',
+        type=int,
+        default=42,
+        help='Random seed for scaffold splitting'
+    )
     # ===== Model Architecture =====
     parser.add_argument(
         '--embedding-dim',
@@ -239,6 +259,53 @@ def main():
         compound_info_path=args.compound_info,
         filter_missing_mol=True,
     )
+    
+    # ===== Apply scaffold split if requested ===== (新增)
+    if args.use_scaffold_split:
+        from scaffold_split import create_scaffold_folds
+        
+        print(f"\n{'='*80}")
+        print(f"🧬 Creating Scaffold-Based Splits")
+        print(f"{'='*80}")
+        
+        sample_meta = training_data['sample_meta']
+        
+        # 需要 SMILES 字典
+        if 'smiles_dict' not in training_data or 'pert_to_mol_embedding' not in training_data:
+            # 如果没有 smiles_dict，从 compound_info 加载
+            if not args.compound_info:
+                raise ValueError(
+                    "When using --use-scaffold-split, either:\n"
+                    "  1. Ensure training_data contains 'smiles_dict', or\n"
+                    "  2. Provide --compound-info argument"
+                )
+            
+            import pandas as pd
+            compound_info = pd.read_csv(args.compound_info, sep='\t')
+            smiles_dict = dict(zip(
+                compound_info['pert_id'],
+                compound_info['canonical_smiles']
+            ))
+            training_data['smiles_dict'] = smiles_dict
+        else:
+            smiles_dict = training_data.get('smiles_dict', {})
+        
+        # Create scaffold-based folds
+        scaffold_folds = create_scaffold_folds(
+            sample_meta=sample_meta,
+            smiles_dict=smiles_dict,
+            pert_id_col='pert_id',
+            n_folds=args.scaffold_folds,
+            seed=args.scaffold_seed
+        )
+        
+        # Replace original folds
+        training_data['folds'] = scaffold_folds
+        training_data['scaffold_split'] = True
+        
+        print(f"  ✓ Replaced original folds with scaffold-based splits")
+    else:
+        training_data['scaffold_split'] = False
     
     # Create trainer
     trainer = TwoTowerTrainer(

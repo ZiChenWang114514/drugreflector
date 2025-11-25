@@ -351,11 +351,14 @@ class TwoTowerTrainer:
         
         # Save final model
         model_path = output_dir / f"twotower_fold_{fold_id}.pt"
+        model_path = output_dir / f"twotower_fold_{fold_id}.pt"
+        scaffold_split = training_data.get('scaffold_split', False)
         self._save_checkpoint(
             model, fold_id, self.num_epochs - 1, history,
             n_genes, n_compounds, mol_dim,
             gene_names, compound_names,
             model_path,
+            scaffold_split=scaffold_split,  
         )
         
         # Plot training curves
@@ -532,6 +535,7 @@ class TwoTowerTrainer:
         gene_names: list,
         compound_names: list,
         save_path: Path,
+        scaffold_split: bool = False,
     ):
         """Save model checkpoint."""
         checkpoint = {
@@ -539,6 +543,7 @@ class TwoTowerTrainer:
             'fold_id': fold_id,
             'epoch': epoch,
             'history': history,
+            'scaffold_split': scaffold_split,
             'dimensions': {
                 'input_size': n_genes,
                 'output_size': n_compounds,
