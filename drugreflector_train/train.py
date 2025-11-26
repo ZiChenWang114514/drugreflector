@@ -159,6 +159,36 @@ def main():
     )
     
     parser.add_argument(
+        '--lr-scheduler',
+        type=str,
+        default='step',
+        choices=['step', 'exponential', 'cosine'],
+        help='Learning rate scheduler type'
+    )
+
+    parser.add_argument(
+        '--lr-decay-rate',
+        type=float,
+        default=0.1,
+        help='Learning rate decay rate'
+    )
+
+    parser.add_argument(
+        '--lr-decay-epochs',
+        type=int,
+        nargs='+',
+        default=[30, 40],
+        help='Epochs to decay learning rate (for step scheduler)'
+    )
+
+    parser.add_argument(
+        '--plot-dir',
+        type=str,
+        default='training_plots',
+        help='Directory name for training plots (relative to output-dir)'
+    )
+    
+    parser.add_argument(
         '--batch-size',
         type=int,
         default=256,
@@ -191,13 +221,6 @@ def main():
         type=float,
         default=2.0,
         help='Focal loss gamma parameter'
-    )
-    
-    parser.add_argument(
-        '--t0',
-        type=int,
-        default=20,
-        help='CosineAnnealingWarmRestarts T_0 parameter'
     )
     
     # ===== System Arguments =====
@@ -247,17 +270,20 @@ def main():
     trainer = DrugReflectorTrainer(
         device=args.device,
         initial_lr=args.learning_rate,
+        lr_scheduler=args.lr_scheduler,
+        lr_decay_rate=args.lr_decay_rate,
+        lr_decay_epochs=args.lr_decay_epochs,
         min_lr=args.min_lr,
         weight_decay=args.weight_decay,
-        t_0=args.t0,
         focal_gamma=args.focal_gamma,
         batch_size=args.batch_size,
         num_epochs=args.epochs,
         num_workers=args.num_workers,
         save_every=args.save_every,
+        plot_dir=args.plot_dir,
         verbose=not args.quiet
     )
-    
+        
     output_dir = Path(args.output_dir)
     
     # Train based on mode

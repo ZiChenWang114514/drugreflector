@@ -90,8 +90,14 @@ class DrugReflectorTrainer:
         Device for training ('auto', 'cuda', or 'cpu')
     initial_lr : float
         Initial learning rate
+    lr_scheduler : str
+        Learning rate scheduler type ('step', 'exponential', or 'cosine')
+    lr_decay_rate : float
+        Learning rate decay rate (for step/exponential schedulers)
+    lr_decay_epochs : List[int]
+        Epochs at which to decay learning rate (for step scheduler)
     min_lr : float
-        Minimum learning rate for scheduler
+        Minimum learning rate
     weight_decay : float
         L2 regularization weight decay
     t_0 : int
@@ -108,20 +114,25 @@ class DrugReflectorTrainer:
         Save checkpoint every N epochs
     verbose : bool
         Print detailed training information
+    plot_dir : str
+        Directory to save training plots
     """
     
     def __init__(
         self,
         device: str = 'auto',
         initial_lr: float = 0.0139,
+        lr_scheduler: str = 'step',  # 'step', 'exponential', or 'cosine'
+        lr_decay_rate: float = 0.1,
+        lr_decay_epochs: List[int] = None,  # For step scheduler
         min_lr: float = 0.00001,
         weight_decay: float = 1e-5,
-        t_0: int = 20,
         focal_gamma: float = 2.0,
         batch_size: int = 256,
         num_epochs: int = 50,
         num_workers: int = 4,
         save_every: int = 10,
+        plot_dir: str = 'training_plots',  # 新增：图表输出目录
         verbose: bool = True
     ):
         if device == 'auto':
@@ -130,14 +141,17 @@ class DrugReflectorTrainer:
             self.device = device
             
         self.initial_lr = initial_lr
+        self.lr_scheduler = lr_scheduler
+        self.lr_decay_rate = lr_decay_rate
+        self.lr_decay_epochs = lr_decay_epochs if lr_decay_epochs else [30, 40]
         self.min_lr = min_lr
         self.weight_decay = weight_decay
-        self.t_0 = t_0
         self.focal_gamma = focal_gamma
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.num_workers = num_workers
         self.save_every = save_every
+        self.plot_dir = plot_dir
         self.verbose = verbose
         
         if self.verbose:
@@ -146,12 +160,16 @@ class DrugReflectorTrainer:
             print(f"{'='*80}")
             print(f"  Device: {self.device}")
             print(f"  Initial LR: {self.initial_lr}")
+            print(f"  LR Scheduler: {self.lr_scheduler}")
+            if self.lr_scheduler == 'step':
+                print(f"  LR Decay Rate: {self.lr_decay_rate}")
+                print(f"  LR Decay Epochs: {self.lr_decay_epochs}")
             print(f"  Min LR: {self.min_lr}")
             print(f"  Weight Decay: {self.weight_decay}")
             print(f"  Focal γ: {self.focal_gamma}")
             print(f"  Batch size: {self.batch_size}")
             print(f"  Epochs: {self.num_epochs}")
-            print(f"  Workers: {self.num_workers}")
+            print(f"  Plot Directory: {self.plot_dir}")
     
     def create_model(self, input_size: int, output_size: int) -> nn.Module:
         """
@@ -181,6 +199,48 @@ class DrugReflectorTrainer:
         )
         return model
     
+    def create_scheduler(self, optimizer: torch.optim.Optimizer):
+        """
+        Create learning rate scheduler with simple decay strategy.
+        
+        Parameters
+        ----------
+        optimizer : torch.optim.Optimizer
+            Optimizer instance
+        
+        Returns
+        -------
+        torch.optim.lr_scheduler._LRScheduler
+            Learning rate scheduler
+        """
+        if self.lr_scheduler == 'step':
+            # Step decay: multiply LR by decay_rate at specified epochs
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer,
+                milestones=self.lr_decay_epochs,
+                gamma=self.lr_decay_rate
+            )
+        elif self.lr_scheduler == 'exponential':
+            # Exponential decay: LR = initial_lr * (decay_rate ^ epoch)
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer,
+                gamma=self.lr_decay_rate
+            )
+        elif self.lr_scheduler == 'cosine':
+            # Simple cosine annealing (no warm restarts)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.num_epochs,
+                eta_min=self.min_lr
+            )
+        else:
+            raise ValueError(f"Unknown scheduler: {self.lr_scheduler}")
+        
+        if self.verbose:
+            print(f"  📊 Using {self.lr_scheduler} LR scheduler")
+        
+        return scheduler
+
     def train_single_fold(
         self,
         training_data: Dict,
@@ -300,12 +360,7 @@ class DrugReflectorTrainer:
             lr=self.initial_lr,
             weight_decay=self.weight_decay
         )
-        scheduler = CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=self.t_0,
-            T_mult=1,
-            eta_min=self.min_lr
-        )
+        scheduler = self.create_scheduler(optimizer)
         
         # Training history
         history = {
@@ -402,7 +457,15 @@ class DrugReflectorTrainer:
             n_genes, n_compounds, gene_names, compound_names,
             model_path
         )
-        
+
+        if self.verbose:
+            print(f"\n💾 Final model saved: {model_path}")
+
+        # Plot training metrics
+        if self.verbose:
+            print(f"\n📊 Generating training plots...")
+        self._plot_training_metrics(history, fold_id, output_dir)
+                
         if self.verbose:
             print(f"\n💾 Final model saved: {model_path}")
         
@@ -747,3 +810,176 @@ class DrugReflectorTrainer:
             print(f"📊 Ensemble comparison saved: {plot_path}")
         
         plt.close()
+        
+    def _plot_training_metrics(
+        self, 
+        history: Dict, 
+        fold_id: int, 
+        output_dir: Path
+    ):
+        """
+        Plot detailed training metrics for a single fold.
+        
+        Parameters
+        ----------
+        history : Dict
+            Training history
+        fold_id : int
+            Fold identifier
+        output_dir : Path
+            Output directory for plots
+        """
+        plot_dir = output_dir / self.plot_dir
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        
+        epochs = np.arange(1, len(history['train_loss']) + 1)
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(16, 10))
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        
+        # 1. Loss curves (combined)
+        ax1 = fig.add_subplot(gs[0, :2])
+        ax1.plot(epochs, history['train_loss'], 
+                label='Train Loss', color='#2E86AB', linewidth=2, alpha=0.8)
+        ax1.plot(epochs, history['val_loss'], 
+                label='Val Loss', color='#A23B72', linewidth=2, alpha=0.8)
+        ax1.set_xlabel('Epoch', fontsize=11)
+        ax1.set_ylabel('Loss', fontsize=11)
+        ax1.set_title('Training and Validation Loss', fontsize=13, fontweight='bold')
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Learning Rate
+        ax2 = fig.add_subplot(gs[0, 2])
+        ax2.plot(epochs, history['learning_rates'], 
+                color='#F18F01', linewidth=2)
+        ax2.set_xlabel('Epoch', fontsize=11)
+        ax2.set_ylabel('Learning Rate', fontsize=11)
+        ax2.set_title('Learning Rate Schedule', fontsize=13, fontweight='bold')
+        ax2.set_yscale('log')
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. Top 1% Recall (main metric)
+        ax3 = fig.add_subplot(gs[1, 0])
+        ax3.plot(epochs, history['val_recall'], 
+                color='#06A77D', linewidth=2.5, marker='o', 
+                markersize=4, markevery=max(1, len(epochs)//20))
+        best_epoch = np.argmax(history['val_recall'])
+        best_recall = history['val_recall'][best_epoch]
+        ax3.scatter([best_epoch + 1], [best_recall], 
+                color='red', s=200, zorder=5, marker='*',
+                label=f'Best: {best_recall:.4f}')
+        ax3.set_xlabel('Epoch', fontsize=11)
+        ax3.set_ylabel('Recall', fontsize=11)
+        ax3.set_title('Top 1% Recall (Main Metric)', fontsize=13, fontweight='bold')
+        ax3.legend(fontsize=9)
+        ax3.grid(True, alpha=0.3)
+        ax3.set_ylim([0, 1])
+        
+        # 4. Top-1 Accuracy
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.plot(epochs, history['val_top1_acc'], 
+                color='#D62839', linewidth=2, marker='s',
+                markersize=3, markevery=max(1, len(epochs)//20))
+        ax4.set_xlabel('Epoch', fontsize=11)
+        ax4.set_ylabel('Accuracy', fontsize=11)
+        ax4.set_title('Top-1 Accuracy', fontsize=13, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        ax4.set_ylim([0, max(history['val_top1_acc']) * 1.1])
+        
+        # 5. Top-10 Accuracy
+        ax5 = fig.add_subplot(gs[1, 2])
+        ax5.plot(epochs, history['val_top10_acc'], 
+                color='#8338EC', linewidth=2, marker='^',
+                markersize=3, markevery=max(1, len(epochs)//20))
+        ax5.set_xlabel('Epoch', fontsize=11)
+        ax5.set_ylabel('Accuracy', fontsize=11)
+        ax5.set_title('Top-10 Accuracy', fontsize=13, fontweight='bold')
+        ax5.grid(True, alpha=0.3)
+        ax5.set_ylim([0, 1])
+        
+        # 6. Accuracy comparison
+        ax6 = fig.add_subplot(gs[2, :2])
+        ax6.plot(epochs, history['val_top1_acc'], 
+                label='Top-1', color='#D62839', linewidth=2, alpha=0.8)
+        ax6.plot(epochs, history['val_top10_acc'], 
+                label='Top-10', color='#8338EC', linewidth=2, alpha=0.8)
+        ax6.plot(epochs, history['val_recall'], 
+                label='Top 1% Recall', color='#06A77D', linewidth=2, alpha=0.8)
+        ax6.set_xlabel('Epoch', fontsize=11)
+        ax6.set_ylabel('Score', fontsize=11)
+        ax6.set_title('All Metrics Comparison', fontsize=13, fontweight='bold')
+        ax6.legend(fontsize=10, loc='lower right')
+        ax6.grid(True, alpha=0.3)
+        ax6.set_ylim([0, 1])
+        
+        # 7. Epoch time
+        ax7 = fig.add_subplot(gs[2, 2])
+        ax7.bar(epochs, history['epoch_times'], 
+            color='#FB5607', alpha=0.7, edgecolor='black', linewidth=0.5)
+        ax7.axhline(y=np.mean(history['epoch_times']), 
+                color='red', linestyle='--', linewidth=2,
+                label=f'Mean: {np.mean(history["epoch_times"]):.1f}s')
+        ax7.set_xlabel('Epoch', fontsize=11)
+        ax7.set_ylabel('Time (seconds)', fontsize=11)
+        ax7.set_title('Epoch Training Time', fontsize=13, fontweight='bold')
+        ax7.legend(fontsize=9)
+        ax7.grid(True, alpha=0.3, axis='y')
+        
+        # Overall title
+        fig.suptitle(f'Training Metrics - Fold {fold_id}', 
+                    fontsize=16, fontweight='bold', y=0.995)
+        
+        # Save plot
+        plot_path = plot_dir / f'fold_{fold_id}_metrics.png'
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        
+        if self.verbose:
+            print(f"  📊 Metrics plot saved: {plot_path}")
+        
+        plt.close()
+        
+        # Also save a summary statistics file
+        self._save_metrics_summary(history, fold_id, plot_dir)
+
+    def _save_metrics_summary(
+        self,
+        history: Dict,
+        fold_id: int,
+        plot_dir: Path
+    ):
+        """Save metrics summary as text file."""
+        summary_path = plot_dir / f'fold_{fold_id}_summary.txt'
+        
+        with open(summary_path, 'w') as f:
+            f.write(f"{'='*60}\n")
+            f.write(f"Training Summary - Fold {fold_id}\n")
+            f.write(f"{'='*60}\n\n")
+            
+            # Best metrics
+            best_recall_epoch = np.argmax(history['val_recall'])
+            f.write(f"Best Metrics:\n")
+            f.write(f"  Top 1% Recall: {history['val_recall'][best_recall_epoch]:.4f} (Epoch {best_recall_epoch + 1})\n")
+            f.write(f"  Top-1 Acc: {history['val_top1_acc'][best_recall_epoch]:.4f}\n")
+            f.write(f"  Top-10 Acc: {history['val_top10_acc'][best_recall_epoch]:.4f}\n")
+            f.write(f"  Val Loss: {history['val_loss'][best_recall_epoch]:.4f}\n\n")
+            
+            # Final metrics
+            f.write(f"Final Metrics (Epoch {len(history['train_loss'])}):\n")
+            f.write(f"  Top 1% Recall: {history['val_recall'][-1]:.4f}\n")
+            f.write(f"  Top-1 Acc: {history['val_top1_acc'][-1]:.4f}\n")
+            f.write(f"  Top-10 Acc: {history['val_top10_acc'][-1]:.4f}\n")
+            f.write(f"  Train Loss: {history['train_loss'][-1]:.4f}\n")
+            f.write(f"  Val Loss: {history['val_loss'][-1]:.4f}\n\n")
+            
+            # Training statistics
+            f.write(f"Training Statistics:\n")
+            f.write(f"  Total Epochs: {len(history['train_loss'])}\n")
+            f.write(f"  Total Time: {sum(history['epoch_times']):.1f}s ({sum(history['epoch_times'])/60:.1f}m)\n")
+            f.write(f"  Avg Epoch Time: {np.mean(history['epoch_times']):.1f}s\n")
+            f.write(f"  Initial LR: {history['learning_rates'][0]:.6f}\n")
+            f.write(f"  Final LR: {history['learning_rates'][-1]:.6f}\n")
+        
+        if self.verbose:
+            print(f"  📄 Summary saved: {summary_path}")
