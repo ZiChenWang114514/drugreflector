@@ -127,12 +127,13 @@ class DrugReflectorTrainer:
         lr_decay_epochs: List[int] = None,  # For step scheduler
         min_lr: float = 0.00001,
         weight_decay: float = 1e-5,
+        dropout_p: float = 0.64,
         focal_gamma: float = 2.0,
         batch_size: int = 256,
         num_epochs: int = 50,
         num_workers: int = 4,
         save_every: int = 10,
-        plot_dir: str = 'training_plots',  # 新增：图表输出目录
+        plot_dir: str = 'training_plots',
         verbose: bool = True
     ):
         if device == 'auto':
@@ -146,6 +147,7 @@ class DrugReflectorTrainer:
         self.lr_decay_epochs = lr_decay_epochs if lr_decay_epochs else [30, 40]
         self.min_lr = min_lr
         self.weight_decay = weight_decay
+        self.dropout_p = dropout_p
         self.focal_gamma = focal_gamma
         self.batch_size = batch_size
         self.num_epochs = num_epochs
@@ -166,6 +168,7 @@ class DrugReflectorTrainer:
                 print(f"  LR Decay Epochs: {self.lr_decay_epochs}")
             print(f"  Min LR: {self.min_lr}")
             print(f"  Weight Decay: {self.weight_decay}")
+            print(f"  Dropout: {self.dropout_p}")
             print(f"  Focal γ: {self.focal_gamma}")
             print(f"  Batch size: {self.batch_size}")
             print(f"  Epochs: {self.num_epochs}")
@@ -191,7 +194,7 @@ class DrugReflectorTrainer:
             input_dim=input_size,
             output_dim=output_size,
             hidden_dims=[1024, 2048],  # SI Page 2
-            dropout_p=0.64,  # SI Table S5
+            dropout_p=self.dropout_p,
             activation='ReLU',
             batch_norm=True,
             order='act-drop-bn',
@@ -673,7 +676,7 @@ class DrugReflectorTrainer:
                 'model_init_params': {
                     'torch_init_params': {
                         'hidden_dims': [1024, 2048],
-                        'dropout_p': 0.64,
+                        'dropout_p': self.dropout_p,
                         'activation': 'ReLU',
                         'batch_norm': True,
                         'order': 'act-drop-bn',
@@ -685,7 +688,8 @@ class DrugReflectorTrainer:
                 'initial_lr': self.initial_lr,
                 'min_lr': self.min_lr,
                 'weight_decay': self.weight_decay,
-                't_0': self.t_0,
+                'dropout_p': self.dropout_p,
+                'lr_scheduler': self.lr_scheduler,
                 'focal_gamma': self.focal_gamma,
                 'batch_size': self.batch_size,
                 'num_epochs': self.num_epochs
@@ -733,7 +737,8 @@ class DrugReflectorTrainer:
                 'initial_lr': self.initial_lr,
                 'min_lr': self.min_lr,
                 'weight_decay': self.weight_decay,
-                't_0': self.t_0,
+                'dropout_p': self.dropout_p,
+                'lr_scheduler': self.lr_scheduler,
                 'focal_gamma': self.focal_gamma,
                 'batch_size': self.batch_size,
                 'num_epochs': self.num_epochs

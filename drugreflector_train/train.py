@@ -159,6 +159,13 @@ def main():
     )
     
     parser.add_argument(
+        '--dropout',
+        type=float,
+        default=0.64,
+        help='Dropout probability (from SI Table S5: 0.64)'
+    )
+    
+    parser.add_argument(
         '--lr-scheduler',
         type=str,
         default='step',
@@ -275,6 +282,7 @@ def main():
         lr_decay_epochs=args.lr_decay_epochs,
         min_lr=args.min_lr,
         weight_decay=args.weight_decay,
+        dropout_p=args.dropout,
         focal_gamma=args.focal_gamma,
         batch_size=args.batch_size,
         num_epochs=args.epochs,
