@@ -14,9 +14,7 @@ __pycache__/
 *.pkl
 *.pickle
 *.json
-models/*.pt
-models/*.pth
-models/*.h5ad
+models/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/

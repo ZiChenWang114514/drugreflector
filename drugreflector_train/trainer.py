@@ -568,14 +568,17 @@ class DrugReflectorTrainer:
         model: nn.Module,
         loader: DataLoader,
         criterion: nn.Module,
-        optimizer: torch.optim.Optimizer
+        optimizer: torch.optim.Optimizer,
     ) -> float:
         """Train for one epoch."""
         model.train()
         total_loss = 0.0
         n_batches = 0
         
-        pbar = tqdm(loader, desc="Training", leave=False, disable=not self.verbose)
+        if self.verbose:
+            pbar = tqdm(loader, desc="Training", leave=False, disable=not self.verbose)
+        else:
+            pbar = loader
         
         for batch_X, batch_y in pbar:
             batch_X = batch_X.to(self.device)
@@ -610,7 +613,10 @@ class DrugReflectorTrainer:
         all_probs = []
         
         with torch.no_grad():
-            pbar = tqdm(loader, desc="Validating", leave=False, disable=not self.verbose)
+            if self.verbose:
+                pbar = tqdm(loader, desc="Validating", leave=False, disable=not self.verbose)
+            else:
+                pbar = loader
             
             for batch_X, batch_y in pbar:
                 batch_X = batch_X.to(self.device)
