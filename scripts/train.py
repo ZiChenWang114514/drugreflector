@@ -1,8 +1,14 @@
 """
-DrugReflector Training Script - Single Fold Quick Test
+DrugReflector Training Script - Single Fold Quick Test (Fixed NaN Issues)
 
 This script trains a single DrugReflector model on one fold for quick testing.
 Based on the training module from drugreflector_training/ but simplified for rapid iteration.
+
+FIXES:
+- Added gradient clipping to prevent gradient explosion
+- Added NaN/Inf detection and handling
+- Added model state validation
+- Improved numerical stability
 
 Usage:
     python train.py --data-file processed_data/training_data_lincs2020_final.pkl --output-dir models/test_fold0 --fold 0
@@ -72,7 +78,7 @@ def compound_level_topk_recall(labels, probs, k):
 
 class SingleFoldTrainer:
     """
-    Simplified trainer for single fold testing.
+    Simplified trainer for single fold testing with improved numerical stability.
     
     Parameters from SI Table S5 and Page 3:
     - Initial LR: 0.0139
@@ -81,6 +87,11 @@ class SingleFoldTrainer:
     - Dropout: 0.64
     - Focal γ: 2.0
     - T_0: 20
+    
+    Stability improvements:
+    - Gradient clipping (max_norm=1.0)
+    - NaN/Inf detection and handling
+    - Model state validation
     """
     
     def __init__(
@@ -94,7 +105,8 @@ class SingleFoldTrainer:
         batch_size=256,
         num_epochs=50,
         num_workers=4,
-        save_every=10
+        save_every=10,
+        grad_clip_norm=1.0  # NEW: gradient clipping
     ):
         if device == 'auto':
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -110,9 +122,10 @@ class SingleFoldTrainer:
         self.num_epochs = num_epochs
         self.num_workers = num_workers
         self.save_every = save_every
+        self.grad_clip_norm = grad_clip_norm  # NEW
         
         print(f"\n{'='*80}")
-        print(f"🚀 Single Fold Trainer Initialized")
+        print(f"🚀 Single Fold Trainer Initialized (NaN-Safe Version)")
         print(f"{'='*80}")
         print(f"  Device: {self.device}")
         print(f"  Initial LR: {self.initial_lr}")
@@ -120,6 +133,7 @@ class SingleFoldTrainer:
         print(f"  Batch size: {self.batch_size}")
         print(f"  Epochs: {self.num_epochs}")
         print(f"  Workers: {self.num_workers}")
+        print(f"  Gradient Clipping: {self.grad_clip_norm}")  # NEW
         
     def create_model(self, input_size: int, output_size: int) -> nn.Module:
         """Create nnFC model with paper-specified architecture."""
@@ -135,6 +149,14 @@ class SingleFoldTrainer:
         )
         return model
     
+    def _check_model_health(self, model: nn.Module) -> bool:
+        """Check if model parameters contain NaN or Inf."""
+        for name, param in model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"⚠️  Warning: NaN/Inf detected in parameter: {name}")
+                return False
+        return True
+    
     def train(
         self,
         training_data: Dict,
@@ -142,7 +164,7 @@ class SingleFoldTrainer:
         output_dir: Path
     ) -> Dict:
         """
-        Train model on specified fold.
+        Train model on specified fold with improved stability.
         
         Parameters
         ----------
@@ -183,6 +205,14 @@ class SingleFoldTrainer:
         # Preprocess data (clip to [-2, 2] with std=1)
         print(f"\n🔧 Preprocessing signatures...")
         X_processed = clip_and_normalize_signature(X)
+        
+        # Check for NaN/Inf in input data
+        if np.isnan(X_processed).any() or np.isinf(X_processed).any():
+            print(f"⚠️  Warning: NaN/Inf detected in processed input data!")
+            print(f"   NaN count: {np.isnan(X_processed).sum()}")
+            print(f"   Inf count: {np.isinf(X_processed).sum()}")
+            print(f"   Replacing with zeros...")
+            X_processed = np.nan_to_num(X_processed, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Create train/val split
         val_mask = folds == fold_id
@@ -254,12 +284,14 @@ class SingleFoldTrainer:
             'val_top1_acc': [],
             'val_top10_acc': [],
             'learning_rates': [],
-            'epoch_times': []
+            'epoch_times': [],
+            'nan_batches': []  # NEW: track NaN occurrences
         }
         
         best_recall = 0.0
         best_epoch = 0
         best_model_state = None
+        nan_count = 0  # NEW: count NaN occurrences
         
         # Training loop
         print(f"\n{'='*80}")
@@ -275,6 +307,7 @@ class SingleFoldTrainer:
             model.train()
             train_loss = 0.0
             train_batches = 0
+            epoch_nan_count = 0  # NEW
             
             pbar = tqdm(
                 train_loader, 
@@ -289,7 +322,21 @@ class SingleFoldTrainer:
                 optimizer.zero_grad()
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y)
+                
+                # NEW: Check for NaN in loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\n⚠️  Warning: NaN/Inf loss detected at batch {train_batches} in epoch {epoch+1}")
+                    print(f"   Skipping this batch...")
+                    epoch_nan_count += 1
+                    nan_count += 1
+                    continue
+                
                 loss.backward()
+                
+                # NEW: Gradient clipping to prevent explosion
+                if self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.grad_clip_norm)
+                
                 optimizer.step()
                 
                 train_loss += loss.item()
@@ -300,7 +347,23 @@ class SingleFoldTrainer:
                     'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
                 })
             
-            avg_train_loss = train_loss / train_batches
+            # NEW: Check model health after training epoch
+            if not self._check_model_health(model):
+                print(f"\n❌ Model parameters contain NaN/Inf after epoch {epoch+1}!")
+                print(f"   Training stopped. Please try:")
+                print(f"   1. Reduce learning rate (current: {self.initial_lr})")
+                print(f"   2. Increase gradient clipping (current: {self.grad_clip_norm})")
+                print(f"   3. Check input data for anomalies")
+                break
+            
+            avg_train_loss = train_loss / train_batches if train_batches > 0 else float('inf')
+            
+            # NEW: Warn if too many NaN batches
+            if epoch_nan_count > 0:
+                print(f"\n⚠️  Epoch {epoch+1}: Skipped {epoch_nan_count} batches due to NaN/Inf")
+                history['nan_batches'].append(epoch_nan_count)
+            else:
+                history['nan_batches'].append(0)
             
             # ===== Validation =====
             model.eval()
@@ -317,6 +380,12 @@ class SingleFoldTrainer:
                     
                     outputs = model(batch_X)
                     loss = criterion(outputs, batch_y)
+                    
+                    # NEW: Skip validation batch if loss is NaN
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"\n⚠️  Warning: NaN/Inf loss in validation batch {val_batches}")
+                        continue
+                    
                     val_loss += loss.item()
                     val_batches += 1
                     
@@ -327,6 +396,10 @@ class SingleFoldTrainer:
                     all_labels.append(batch_y.cpu().numpy())
                     all_probs.append(probs.cpu().numpy())
             
+            if val_batches == 0:
+                print(f"\n❌ All validation batches produced NaN/Inf! Training stopped.")
+                break
+            
             avg_val_loss = val_loss / val_batches
             
             # Compute metrics
@@ -334,8 +407,21 @@ class SingleFoldTrainer:
             all_labels = np.concatenate(all_labels)
             all_probs = np.concatenate(all_probs)
             
+            # NEW: Check for NaN in predictions
+            if np.isnan(all_probs).any() or np.isinf(all_probs).any():
+                print(f"\n⚠️  Warning: NaN/Inf in validation predictions!")
+                print(f"   Replacing with uniform distribution...")
+                all_probs = np.nan_to_num(all_probs, nan=1.0/all_probs.shape[1])
+                all_probs = all_probs / all_probs.sum(axis=1, keepdims=True)
+            
             top1_acc = accuracy_score(all_labels, all_preds)
-            top10_acc = top_k_accuracy_score(all_labels, all_probs, k=10)
+            
+            # NEW: Safe top-k accuracy computation
+            try:
+                top10_acc = top_k_accuracy_score(all_labels, all_probs, k=10)
+            except ValueError as e:
+                print(f"\n⚠️  Warning: Could not compute top-10 accuracy: {e}")
+                top10_acc = 0.0
             
             # Top 1% recall (main metric from paper)
             top1_percent_k = max(1, int(0.01 * all_probs.shape[1]))
@@ -363,6 +449,8 @@ class SingleFoldTrainer:
             print(f"  Val Top-1 Acc: {top1_acc:.4f}")
             print(f"  Val Top-10 Acc: {top10_acc:.4f}")
             print(f"  Learning Rate: {current_lr:.6f}")
+            if epoch_nan_count > 0:
+                print(f"  ⚠️  NaN batches skipped: {epoch_nan_count}")
             
             # Save best model
             if recall > best_recall:
@@ -393,6 +481,8 @@ class SingleFoldTrainer:
             print(f"  Best epoch: {best_epoch + 1}/{self.num_epochs}")
             print(f"  Best recall: {best_recall:.4f}")
             print(f"  Total time: {sum(history['epoch_times']):.1f}s ({sum(history['epoch_times'])/60:.1f}m)")
+            if nan_count > 0:
+                print(f"  ⚠️  Total NaN batches encountered: {nan_count}")
         
         # Save final model
         model_path = output_dir / f"model_fold_{fold_id}.pt"
@@ -416,7 +506,8 @@ class SingleFoldTrainer:
             'model': model,
             'history': history,
             'best_recall': best_recall,
-            'best_epoch': best_epoch
+            'best_epoch': best_epoch,
+            'nan_count': nan_count  # NEW
         }
     
     def _save_checkpoint(
@@ -462,7 +553,8 @@ class SingleFoldTrainer:
                 't_0': self.t_0,
                 'focal_gamma': self.focal_gamma,
                 'batch_size': self.batch_size,
-                'num_epochs': self.num_epochs
+                'num_epochs': self.num_epochs,
+                'grad_clip_norm': self.grad_clip_norm  # NEW
             }
         }
         
@@ -523,7 +615,7 @@ class SingleFoldTrainer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train single DrugReflector model on one fold (quick test)",
+        description="Train single DrugReflector model on one fold (NaN-safe version)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -600,6 +692,13 @@ def main():
         help='CosineAnnealing T_0 parameter'
     )
     
+    parser.add_argument(
+        '--grad-clip',
+        type=float,
+        default=1.0,
+        help='Gradient clipping max norm (0 to disable)'
+    )
+    
     # System arguments
     parser.add_argument(
         '--device',
@@ -627,7 +726,7 @@ def main():
     
     # Banner
     print(f"\n{'='*80}")
-    print(f"🧬 DRUGREFLECTOR - SINGLE FOLD TRAINING")
+    print(f"🧬 DRUGREFLECTOR - SINGLE FOLD TRAINING (NaN-Safe Version)")
     print(f"{'='*80}")
     print(f"\n📋 Configuration:")
     print(f"  Data file: {args.data_file}")
@@ -637,6 +736,7 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  Initial LR: {args.learning_rate}")
     print(f"  Focal γ: {args.focal_gamma}")
+    print(f"  Gradient Clip: {args.grad_clip}")
     print(f"  Device: {args.device}")
     
     # Load data
@@ -674,7 +774,8 @@ def main():
         batch_size=args.batch_size,
         num_epochs=args.epochs,
         num_workers=args.num_workers,
-        save_every=args.save_every
+        save_every=args.save_every,
+        grad_clip_norm=args.grad_clip  # NEW
     )
     
     # Train
@@ -691,6 +792,8 @@ def main():
     print(f"{'='*80}")
     print(f"  Best recall: {results['best_recall']:.4f}")
     print(f"  Best epoch: {results['best_epoch'] + 1}/{args.epochs}")
+    if results['nan_count'] > 0:
+        print(f"  ⚠️  NaN batches encountered: {results['nan_count']}")
     print(f"  Output directory: {output_dir}")
     print(f"\n📁 Generated files:")
     print(f"  • model_fold_{args.fold}.pt - Final trained model")
@@ -705,6 +808,13 @@ def main():
     print(f"     model = DrugReflector(checkpoint_paths=['{output_dir}/model_fold_{args.fold}.pt'])")
     print(f"  3. Make predictions:")
     print(f"     predictions = model.predict(vscores, n_top=100)")
+    
+    if results['nan_count'] > 0:
+        print(f"\n⚠️  Warning: Training encountered {results['nan_count']} NaN batches")
+        print(f"   Consider:")
+        print(f"   1. Reducing learning rate (try {args.learning_rate * 0.5:.6f})")
+        print(f"   2. Increasing gradient clipping (try {args.grad_clip * 2})")
+        print(f"   3. Checking input data for anomalies")
     
     print(f"\n{'='*80}\n")
 
